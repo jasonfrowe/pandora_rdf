@@ -164,8 +164,9 @@ extract_params = {
     "subtract_local_background": True,
     "background_inner_gap": 2,
     "background_width": 10,
-    "transit_ingress_index": 200,    # first integration inside transit (set to 0 if no transit)
-    "transit_egress_index": 315,     # last integration inside transit  (set to nint-1 if no transit)
+    "use_wavelength_weights": True,   # weight white-light by flux per wavelength (S/N weighting)
+    "transit_ingress_index": 150,    # first integration inside transit (corrected from ephemeris: actual ~152, set to 0 if no transit)
+    "transit_egress_index": 300,     # last integration inside transit (corrected from ephemeris: actual ~299, set to nint-1 if no transit)
     "motion_aperture_guard_pixels": 2,
     "flux_window_low": 0.97,
     "flux_window_high": 1.03,
@@ -180,6 +181,7 @@ photometry_bad_mask = bad_mask | repair_mask
 extracted_spectra, extracted_dispersion, extraction_info = pandora.extract_trace_spectra_variable_aperture(
     slope_cube,
     aperture_model=aperture_model,
+	bad_pixel_mask=photometry_bad_mask,
     subtract_background=extract_params["subtract_local_background"],
     background_inner_gap=extract_params["background_inner_gap"],
     background_width=extract_params["background_width"],
@@ -206,6 +208,7 @@ wl = pandora.compute_white_light_products(
     extracted_spectra_masked, extraction_info, exposure_time_s, nint, ngroup,
     transit_ingress_index=extract_params["transit_ingress_index"],
     transit_egress_index=extract_params["transit_egress_index"],
+    use_wavelength_weights=extract_params["use_wavelength_weights"],
 )
 integration_time_axis = wl["integration_time_axis"]
 time_axis_label      = wl["time_axis_label"]
@@ -267,12 +270,32 @@ diff_motion_params = {
 }
 # %%
 # Explore image drift from difference imaging.
-# Build a reference from out-of-transit integrations when available.
+# Pass 1: rough reference from raw OOT median, used only to estimate initial shifts.
 if np.any(oot_mask):
-	diff_reference = np.nanmedian(slope_cube[oot_mask], axis=0)
+	rough_reference = np.nanmedian(slope_cube[oot_mask], axis=0)
 else:
-	diff_reference = np.nanmedian(slope_cube, axis=0)
+	rough_reference = np.nanmedian(slope_cube, axis=0)
 
+diff_shift_init = pandora.estimate_difference_image_shifts(
+	slope_cube,
+	reference_image=rough_reference,
+	bad_pixel_mask=photometry_bad_mask,
+	kernel_dx=diff_motion_params["kernel_dx"],
+	kernel_dy=diff_motion_params["kernel_dy"],
+	background_order=diff_motion_params["background_order"],
+	clip_sigma=diff_motion_params["clip_sigma"],
+	min_valid_pixels=diff_motion_params["min_valid_pixels"],
+)
+
+# Build aligned master frame from shifted OOT integrations.
+diff_reference = pandora.build_aligned_master_frame(
+	slope_cube,
+	diff_shift_init["dx"],
+	diff_shift_init["dy"],
+	use_mask=oot_mask,
+)
+
+# Pass 2: refined shifts against aligned master frame.
 diff_shift = pandora.estimate_difference_image_shifts(
 	slope_cube,
 	reference_image=diff_reference,
@@ -314,5 +337,141 @@ pandora.plot_difference_imaging_motion(
 	oot_mask=oot_mask,
 	dx_reference=dx,
 	dy_reference=dy,
+)
+pandora.plot_white_light_vs_dx_log(
+	dx_diff,
+	white_light_norm,
+	oot_mask=oot_mask,
+	integration_keep_mask=integration_keep_mask,
+	dx_label="dx_diff",
+)
+# %%
+
+# Difference-imaging photometry settings.
+diff_phot_params = {
+	"subtract_background": True,
+	"background_inner_gap": 2,
+	"background_width": 10,
+	"use_aperture_weights": True,
+	"weight_sigma_scale": extract_params["weight_sigma_scale"],
+}
+# %%
+# Difference-imaging photometry (aperture sum on reference + per-frame difference flux).
+diff_spectra_total, diff_dispersion, diff_phot_info = pandora.extract_difference_image_photometry(
+	slope_cube,
+	aperture_model,
+	reference_image=diff_reference,
+	shift_x=dx_diff,
+	shift_y=dy_diff,
+	bad_pixel_mask=photometry_bad_mask,
+	subtract_background=diff_phot_params["subtract_background"],
+	background_inner_gap=diff_phot_params["background_inner_gap"],
+	background_width=diff_phot_params["background_width"],
+	background_mask=photometry_bad_mask,
+	use_aperture_weights=diff_phot_params["use_aperture_weights"],
+	weight_sigma_scale=diff_phot_params["weight_sigma_scale"],
+	return_diagnostics=True,
+)
+
+diff_spectra_masked = diff_spectra_total.copy()
+diff_spectra_masked[:, ~channel_good] = np.nan
+
+white_light_diff = np.nansum(diff_spectra_masked, axis=1)
+white_light_diff_norm = white_light_diff / np.nanmedian(white_light_diff[oot_mask])
+
+print(
+	"Difference-image white-light stats: "
+	f"median={np.nanmedian(white_light_diff):.6g}, std={np.nanstd(white_light_diff):.6g}"
+)
+print(
+	"Difference-image normalized scatter (OOT): "
+	f"{1e6*np.nanstd(white_light_diff_norm[oot_mask] - np.nanmedian(white_light_diff_norm[oot_mask])):.1f} ppm"
+)
+
+pandora.plot_difference_image_photometry_comparison(
+	integration_time_axis,
+	white_light_norm,
+	white_light_diff_norm,
+	oot_mask=oot_mask,
+	integration_keep_mask=integration_keep_mask,
+)
+# %%
+plt.plot(integration_time_axis, white_light_norm, marker=".", lw=1, color="0.55", label="Raw background-subtracted")
+plt.plot(integration_time_axis, white_light_clean, lw=1.2, color="tab:green", label="Kept integrations")
+plt.axhline(1.0, color="k", ls=":", lw=1)
+plt.xlabel(time_axis_label)
+plt.ylabel("Normalized white-light flux")
+plt.ylim(0.97, 1.03)
+plt.legend(loc="best", fontsize=8)
+plt.show()
+# %%
+
+# Multimetric diagnostics settings (correlation + PCA + telemetry).
+diagnostic_params = {
+	"telemetry_hdu_names": ("VITL_DATA", "SC_QUATERNIONS", "SC_POSITION", "SC_VELOCITY"),
+	"n_pca_components": 5,
+	"max_plot_labels": 24,
+}
+# %%
+# Explore scatter drivers: photometry vs motion, fit residuals, and spacecraft telemetry.
+integration_jd = np.asarray(time_jd_cube[:, -1], dtype=float)
+
+telemetry_channels = pandora.list_fits_telemetry_channels(fits_path)
+print("Available table telemetry channels by HDU:")
+for hname, cols in telemetry_channels.items():
+	print(f"  {hname}: {cols[:8]}{' ...' if len(cols) > 8 else ''}")
+
+science_header_numeric = pandora.extract_numeric_header_cards(science_header)
+print(f"Numeric RAW SCIENCE header cards: {len(science_header_numeric)}")
+
+telemetry_series = pandora.sample_fits_telemetry_to_integrations(
+	fits_path,
+	integration_jd,
+	hdu_names=diagnostic_params["telemetry_hdu_names"],
+)
+print(f"Sampled telemetry channels onto integration grid: {len(telemetry_series)}")
+
+background_per_integration = np.nanmedian(extraction_info["background_per_pixel"], axis=1)
+metric_series = {
+	"white_light_norm": white_light_norm,
+	"white_light_clean": white_light_clean,
+	"white_light_raw": wl["white_light"],
+	"white_light_diff_raw": white_light_diff,
+	"white_light_diff_norm": white_light_diff_norm,
+	"white_light_delta_norm": white_light_diff_norm - white_light_norm,
+	"dx_aperture": dx,
+	"dy_aperture": dy,
+	"r_aperture": np.sqrt(dx * dx + dy * dy),
+	"dx_diff": dx_diff,
+	"dy_diff": dy_diff,
+	"r_diff": np.sqrt(dx_diff * dx_diff + dy_diff * dy_diff),
+	"diff_bg_offset": diff_shift["background_offset"],
+	"diff_bg_x": diff_shift["background_x"],
+	"diff_bg_y": diff_shift["background_y"],
+	"diff_resid_rms": diff_shift["residual_rms"],
+	"diff_valid_px": diff_shift["n_valid_pixels"].astype(float),
+	"bkg_per_integration": background_per_integration,
+	"keep_mask": integration_keep_mask.astype(float),
+}
+metric_series.update(telemetry_series)
+
+metric_diag = pandora.compute_multimetric_correlation_and_pca(
+	metric_series,
+	white_key="white_light_norm",
+	oot_mask=oot_mask,
+	n_components=diagnostic_params["n_pca_components"],
+)
+
+print("Top |corr| with white_light_norm:")
+keys = metric_diag["keys"]
+corr_to_wl = metric_diag["corr_to_white"]
+order = np.argsort(np.abs(corr_to_wl))[::-1]
+for idx in order[:12]:
+	print(f"  {keys[idx]:>24s}: {corr_to_wl[idx]: .4f}")
+
+pandora.plot_multimetric_correlation_and_pca(
+	metric_diag,
+	white_light_norm=white_light_norm,
+	max_labels=diagnostic_params["max_plot_labels"],
 )
 # %%

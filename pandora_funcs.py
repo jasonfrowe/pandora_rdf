@@ -189,96 +189,1138 @@ def display_science_image(
 	plt.tight_layout()
 	plt.show()
 
+def dilate_binary_mask(mask, iterations=1):
+	"""Dilate a 2D boolean mask with 8-connectivity using numpy only."""
+	m = np.asarray(mask, dtype=bool)
+	if m.ndim != 2:
+		raise ValueError(f"mask must be 2D, got shape {m.shape}.")
+
+	out = m.copy()
+	for _ in range(max(0, int(iterations))):
+		grown = out.copy()
+		for dr in (-1, 0, 1):
+			for dc in (-1, 0, 1):
+				if dr == 0 and dc == 0:
+					continue
+				shift = np.roll(np.roll(out, dr, axis=0), dc, axis=1)
+				if dr > 0:
+					shift[:dr, :] = False
+				elif dr < 0:
+					shift[dr:, :] = False
+				if dc > 0:
+					shift[:, :dc] = False
+				elif dc < 0:
+					shift[:, dc:] = False
+				grown |= shift
+		out = grown
+
+	return out
+
+
+def detect_bad_pixel_clumps_from_ramp_fit(
+	intercept_cube,
+	slope_cube,
+	scatter_cube=None,
+	min_intercept_offset_dn=150.0,
+	intercept_sigma=8.0,
+	slope_percentile=2.0,
+	scatter_sigma=8.0,
+	dilate_iterations=1,
+):
+	"""Detect persistent bad/hot clumps using ramp-fit intercept/slope diagnostics."""
+	intercept = np.asarray(intercept_cube, dtype=float)
+	slope = np.asarray(slope_cube, dtype=float)
+	if intercept.ndim != 3 or slope.ndim != 3:
+		raise ValueError("intercept_cube and slope_cube must both be 3D arrays.")
+	if intercept.shape != slope.shape:
+		raise ValueError(
+			f"intercept_cube shape {intercept.shape} must match slope_cube {slope.shape}."
+		)
+
+	pixel_intercept = np.nanmedian(intercept, axis=0)
+	pixel_slope = np.nanmedian(slope, axis=0)
+
+	i_med = float(np.nanmedian(pixel_intercept))
+	i_mad = float(np.nanmedian(np.abs(pixel_intercept - i_med)))
+	i_sig = 1.4826 * i_mad
+	i_thr = max(i_med + intercept_sigma * i_sig, i_med + min_intercept_offset_dn)
+
+	finite_slope = pixel_slope[np.isfinite(pixel_slope)]
+	if finite_slope.size == 0:
+		s_thr = 0.0
+	else:
+		s_thr = float(np.nanpercentile(finite_slope, slope_percentile))
+
+	mask = (pixel_intercept > i_thr) & (pixel_slope < s_thr)
+
+	if scatter_cube is not None:
+		scatter = np.asarray(scatter_cube, dtype=float)
+		if scatter.shape != intercept.shape:
+			raise ValueError(
+				f"scatter_cube shape {scatter.shape} must match intercept_cube {intercept.shape}."
+			)
+		pixel_scatter = np.nanmedian(scatter, axis=0)
+		sc_med = float(np.nanmedian(pixel_scatter))
+		sc_mad = float(np.nanmedian(np.abs(pixel_scatter - sc_med)))
+		sc_sig = 1.4826 * sc_mad
+		sc_thr = sc_med + scatter_sigma * sc_sig
+		mask |= pixel_scatter > sc_thr
+	else:
+		sc_thr = np.nan
+
+	mask |= ~np.isfinite(pixel_intercept) | ~np.isfinite(pixel_slope)
+
+	for _ in range(max(0, int(dilate_iterations))):
+		mask = dilate_binary_mask(mask, iterations=1)
+
+	info = {
+		"intercept_threshold_dn": float(i_thr),
+		"slope_threshold": float(s_thr),
+		"scatter_threshold": float(sc_thr) if np.isfinite(sc_thr) else None,
+		"clump_fraction": float(np.mean(mask)),
+		"n_clump_pixels": int(np.sum(mask)),
+	}
+	return mask, info
+
+
+def correct_bad_pixels_with_neighbors(
+	cube,
+	bad_mask,
+	max_radius=3,
+	min_neighbors=4,
+):
+	"""Replace bad pixels/clumps with local robust neighbor medians per frame."""
+	arr = np.asarray(cube, dtype=float)
+	if arr.ndim != 3:
+		raise ValueError(f"cube must be 3D, got shape {arr.shape}.")
+
+	mask = np.asarray(bad_mask, dtype=bool)
+	if mask.shape != arr.shape[1:]:
+		raise ValueError(
+			f"bad_mask shape {mask.shape} must match image plane {arr.shape[1:]}."
+		)
+
+	if not np.any(mask):
+		return arr.copy(), {"n_fixed": 0, "fixed_fraction": 0.0}
+
+	ny, nx = mask.shape
+	idx = np.argwhere(mask)
+	corrected = arr.copy()
+	n_fixed = 0
+
+	for f in range(corrected.shape[0]):
+		frame = corrected[f]
+		for r, c in idx:
+			filled = False
+			for rad in range(1, max(1, int(max_radius)) + 1):
+				r0 = max(0, r - rad)
+				r1 = min(ny, r + rad + 1)
+				c0 = max(0, c - rad)
+				c1 = min(nx, c + rad + 1)
+
+				patch = frame[r0:r1, c0:c1]
+				patch_mask = mask[r0:r1, c0:c1]
+				vals = patch[~patch_mask]
+				vals = vals[np.isfinite(vals)]
+
+				if vals.size >= min_neighbors:
+					frame[r, c] = float(np.median(vals))
+					filled = True
+					n_fixed += 1
+					break
+
+			if not filled:
+				frame[r, c] = np.nan
+
+		corrected[f] = frame
+
+	info = {
+		"n_fixed": int(n_fixed),
+		"fixed_fraction": float(n_fixed / (mask.sum() * corrected.shape[0])),
+	}
+	return corrected, info
+
+
 @njit(parallel=True, fastmath=True)
-def get_slope_cube_owls(ramp_cube, times, read_noise=10.0, gain=1.0, threshold=4.0):
+def _get_slope_cube_owls_numba(ramp_cube, times, read_noise=10.0, gain=1.0, threshold=4.0):
+	"""
+	Computes CR-rejected, optimally weighted least squares slopes for a full JWST data cube.
+
+	Parameters:
+	- ramp_cube: 4D numpy array [nint, ngroup, nx, ny]
+	- times: 1D numpy array of exposure times per group
+	- read_noise: Detector read noise in electrons (estimate)
+	- gain: Detector gain in e-/DN
+	- threshold: Sigma threshold for jump detection
+
+	Returns:
+	- slope_cube: 3D numpy array [nint, nx, ny] containing the calculated slopes
+	"""
+	nint, ngroup, nx, ny = ramp_cube.shape
+	slope_cube = np.zeros((nint, nx, ny), dtype=np.float32)
+	intercept_cube = np.zeros((nint, nx, ny), dtype=np.float32)
+	scatter_cube = np.zeros((nint, nx, ny), dtype=np.float32)
+
+	dt = np.empty(ngroup - 1, dtype=np.float32)
+	for g in range(ngroup - 1):
+		dt[g] = times[g + 1] - times[g]
+
+	for i in prange(nint):
+		for x in range(nx):
+			for y in range(ny):
+				counts = np.empty(ngroup, dtype=np.float32)
+				for g in range(ngroup):
+					counts[g] = ramp_cube[i, g, x, y]
+
+				rates = np.empty(ngroup - 1, dtype=np.float32)
+				for g in range(ngroup - 1):
+					rates[g] = (counts[g + 1] - counts[g]) / dt[g]
+
+				med_rate = np.median(rates)
+
+				abs_devs = np.empty(ngroup - 1, dtype=np.float32)
+				for g in range(ngroup - 1):
+					abs_devs[g] = np.abs(rates[g] - med_rate)
+				mad = np.median(abs_devs)
+
+				sigma = mad * 1.4826
+				if sigma < 1e-6:
+					sigma = np.std(rates) + 1e-6
+
+				corrected_counts = counts.copy()
+				for g in range(ngroup - 1):
+					if np.abs(rates[g] - med_rate) > (threshold * sigma):
+						expected_diff = med_rate * dt[g]
+						actual_diff = counts[g + 1] - counts[g]
+						excess = actual_diff - expected_diff
+
+						for k in range(g + 1, ngroup):
+							corrected_counts[k] -= excess
+
+				sum_w = 0.0
+				sum_wx = 0.0
+				sum_wy = 0.0
+				sum_wxx = 0.0
+				sum_wxy = 0.0
+
+				for g in range(ngroup):
+					t = times[g]
+					c = corrected_counts[g]
+					variance = (read_noise ** 2) + (max(c, 0.0) / gain)
+					w = 1.0 / variance
+
+					sum_w += w
+					sum_wx += w * t
+					sum_wy += w * c
+					sum_wxx += w * t * t
+					sum_wxy += w * t * c
+
+				delta = (sum_w * sum_wxx) - (sum_wx * sum_wx)
+
+				if delta != 0.0:
+					slope = (sum_w * sum_wxy - sum_wx * sum_wy) / delta
+					intercept = (sum_wy - slope * sum_wx) / sum_w
+					slope_cube[i, x, y] = slope
+					intercept_cube[i, x, y] = intercept
+
+					residual_sum = 0.0
+					for g in range(ngroup):
+						resid = corrected_counts[g] - (intercept + slope * times[g])
+						residual_sum += resid * resid
+					scatter_cube[i, x, y] = np.sqrt(residual_sum / ngroup)
+				else:
+					slope_cube[i, x, y] = 0.0
+					intercept_cube[i, x, y] = 0.0
+					scatter_cube[i, x, y] = 0.0
+
+	return slope_cube, intercept_cube, scatter_cube
+
+
+def get_slope_cube_owls(
+	ramp_cube,
+	times,
+	read_noise=10.0,
+	gain=1.0,
+	threshold=4.0,
+	return_diagnostics=False,
+):
+	"""Compute CR-rejected, optimally weighted least squares slopes.
+
+	When return_diagnostics is True, also returns intercept and residual scatter cubes.
+	"""
+	slope_cube, intercept_cube, scatter_cube = _get_slope_cube_owls_numba(
+		ramp_cube,
+		times,
+		read_noise=read_noise,
+		gain=gain,
+		threshold=threshold,
+	)
+
+	if return_diagnostics:
+		return slope_cube, intercept_cube, scatter_cube
+
+	return slope_cube
+
+
+def _smooth_1d_boxcar(values, window):
+    """Smooth a 1D array with a centered boxcar."""
+    arr = np.asarray(values, dtype=float)
+    if arr.ndim != 1:
+        raise ValueError(f"values must be 1D, got shape {arr.shape}.")
+
+    width = max(1, int(window))
+    if width % 2 == 0:
+        width += 1
+
+    if width == 1:
+        return arr.copy()
+
+    kernel = np.ones(width, dtype=float) / float(width)
+    padded = np.pad(arr, width // 2, mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def estimate_trace_aperture(
+    cube,
+    dispersion_min,
+    dispersion_max,
+    expected_spatial_center,
+    max_half_width,
+    smooth_window=5,
+    threshold_sigma=2.5,
+):
+    """Estimate a spatial profile and simple peak locations for a trace."""
+    arr = np.asarray(cube, dtype=float)
+    if arr.ndim != 3:
+        raise ValueError(f"cube must be 3D, got shape {arr.shape}.")
+
+    n_frames, n_dispersion, n_spatial = arr.shape
+    disp_lo = max(0, int(dispersion_min))
+    disp_hi = min(n_dispersion - 1, int(dispersion_max))
+    if disp_lo > disp_hi:
+        raise ValueError(
+            f"dispersion_min ({dispersion_min}) must be <= dispersion_max ({dispersion_max})."
+        )
+
+    dispersion_pixels = np.arange(disp_lo, disp_hi + 1, dtype=int)
+    window = arr[:, disp_lo : disp_hi + 1, :]
+    profile = np.nanmedian(window, axis=(0, 1))
+    profile_smooth = _smooth_1d_boxcar(profile, smooth_window)
+
+    search_lo = max(0, int(expected_spatial_center - max_half_width))
+    search_hi = min(n_spatial - 1, int(expected_spatial_center + max_half_width))
+    search_profile = profile_smooth[search_lo : search_hi + 1]
+
+    if search_profile.size == 0:
+        raise ValueError("Search window for aperture estimation is empty.")
+
+    baseline = float(np.nanmedian(search_profile))
+    deviation = float(np.nanmedian(np.abs(search_profile - baseline)))
+    sigma = 1.4826 * deviation
+    if not np.isfinite(sigma) or sigma == 0.0:
+        sigma = float(np.nanstd(search_profile))
+    if not np.isfinite(sigma) or sigma == 0.0:
+        sigma = 1.0
+
+    threshold = baseline + threshold_sigma * sigma
+
+    peak_positions = []
+    for idx in range(search_lo + 1, search_hi):
+        value = profile_smooth[idx]
+        if not np.isfinite(value):
+            continue
+        if value < threshold:
+            continue
+        if value >= profile_smooth[idx - 1] and value >= profile_smooth[idx + 1]:
+            peak_positions.append(int(idx))
+
+    if not peak_positions:
+        peak_positions = [int(search_lo + int(np.nanargmax(search_profile)))]
+
+    return {
+        "profile": profile,
+        "profile_smooth": profile_smooth,
+        "threshold": float(threshold),
+        "peak_positions": peak_positions,
+        "spatial_axis": np.arange(n_spatial, dtype=int),
+        "dispersion_pixels": dispersion_pixels,
+        "search_bounds": (search_lo, search_hi),
+        "expected_spatial_center": float(expected_spatial_center),
+        "max_half_width": float(max_half_width),
+    }
+
+
+def build_linear_trace_aperture(
+    n_dispersion,
+    dispersion_min,
+    dispersion_max,
+    spatial_left_start,
+    spatial_left_end,
+    spatial_right_start,
+    spatial_right_end,
+    n_spatial,
+):
+    """Build a simple linearly varying photometric aperture."""
+    n_dispersion = int(n_dispersion)
+    n_spatial = int(n_spatial)
+    if n_dispersion <= 0:
+        raise ValueError("n_dispersion must be positive.")
+    if n_spatial <= 0:
+        raise ValueError("n_spatial must be positive.")
+
+    dispersion_min = int(dispersion_min)
+    dispersion_max = int(dispersion_max)
+    if dispersion_min > dispersion_max:
+        raise ValueError("dispersion_min must be <= dispersion_max.")
+
+    dispersion_pixels = np.arange(dispersion_min, dispersion_max + 1, dtype=int)
+    if dispersion_pixels.size != n_dispersion:
+        raise ValueError(
+            f"n_dispersion ({n_dispersion}) does not match dispersion range size ({dispersion_pixels.size})."
+        )
+
+    spatial_left = np.linspace(float(spatial_left_start), float(spatial_left_end), n_dispersion)
+    spatial_right = np.linspace(float(spatial_right_start), float(spatial_right_end), n_dispersion)
+
+    spatial_min = np.minimum(spatial_left, spatial_right)
+    spatial_max = np.maximum(spatial_left, spatial_right)
+
+    aperture_mask = np.zeros((n_dispersion, n_spatial), dtype=bool)
+    for row_idx in range(n_dispersion):
+        left = max(0, int(np.floor(spatial_min[row_idx])))
+        right = min(n_spatial - 1, int(np.ceil(spatial_max[row_idx])))
+        if left <= right:
+            aperture_mask[row_idx, left : right + 1] = True
+
+    return {
+        "dispersion_pixels": dispersion_pixels,
+        "spatial_left": spatial_left,
+        "spatial_right": spatial_right,
+        "spatial_left_int": np.floor(spatial_min).astype(int),
+        "spatial_right_int": np.ceil(spatial_max).astype(int),
+        "spatial_center": 0.5 * (spatial_left + spatial_right),
+        "spatial_half_width": 0.5 * (spatial_right - spatial_left),
+        "aperture_mask": aperture_mask,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Spectrophotometric extraction helpers
+# ---------------------------------------------------------------------------
+
+def extract_trace_spectra_variable_aperture(
+    cube,
+    aperture_model,
+    subtract_background=False,
+    background_inner_gap=2,
+    background_width=8,
+    background_mask=None,
+    return_diagnostics=False,
+):
+    """Extract spectra using per-dispersion-pixel variable spatial bounds.
+
+    When requested, estimate a local per-dispersion background from sidebands
+    outside the aperture and subtract it after scaling by the aperture width.
+
+    Parameters
+    ----------
+    cube : 3D array, shape (n_int, n_dispersion, n_spatial)
+    aperture_model : dict
+        Output of ``build_linear_trace_aperture``.
+    subtract_background : bool
+        If True, estimate and subtract a local per-pixel background level.
+    background_inner_gap : int
+        Gap in pixels between aperture edge and background sideband.
+    background_width : int
+        Width of background sideband on each side.
+    background_mask : 2D bool array (n_dispersion, n_spatial) or None
+        Additional pixels to exclude from background estimation.
+    return_diagnostics : bool
+        If True return ``(spectra, dispersion, info_dict)``; else
+        return ``(spectra, dispersion)``.
+
+    Returns
+    -------
+    spectra : 2D array, shape (n_int, n_channels)
+    dispersion : 1D int array, shape (n_channels,)
+    info_dict (optional) : dict with keys
+        ``background_per_pixel``, ``background_counts``,
+        ``aperture_width_pixels``
     """
-    Computes CR-rejected, optimally weighted least squares slopes for a full JWST data cube.
-    
-    Parameters:
-    - ramp_cube: 4D numpy array [nint, ngroup, nx, ny]
-    - times: 1D numpy array of exposure times per group
-    - read_noise: Detector read noise in electrons (estimate)
-    - gain: Detector gain in e-/DN
-    - threshold: Sigma threshold for jump detection
-    
-    Returns:
-    - slope_cube: 3D numpy array [nint, nx, ny] containing the calculated slopes
+    arr = np.asarray(cube, dtype=float)
+    if arr.ndim != 3:
+        raise ValueError(f"cube must be 3D, got {arr.shape}.")
+
+    disp = np.asarray(aperture_model["dispersion_pixels"], dtype=int)
+    left = np.asarray(aperture_model["spatial_left_int"], dtype=int)
+    right = np.asarray(aperture_model["spatial_right_int"], dtype=int)
+
+    if not (disp.size == left.size == right.size):
+        raise ValueError("Aperture model arrays must have matching lengths.")
+
+    nint, ndisp, nspat = arr.shape
+    spectra = np.full((nint, disp.size), np.nan, dtype=float)
+    background_per_pixel = np.zeros((nint, disp.size), dtype=float)
+    background_counts = np.zeros((nint, disp.size), dtype=int)
+    aperture_width_pixels = np.zeros(disp.size, dtype=int)
+
+    if background_mask is not None:
+        bg_mask = np.asarray(background_mask, dtype=bool)
+        if bg_mask.shape != (ndisp, nspat):
+            raise ValueError(
+                f"background_mask must have shape {(ndisp, nspat)}, got {bg_mask.shape}."
+            )
+    else:
+        bg_mask = None
+
+    for k, d in enumerate(disp):
+        if d < 0 or d >= ndisp:
+            raise ValueError(f"Dispersion pixel {d} out of bounds for cube shape {arr.shape}.")
+        c0 = max(0, int(left[k]))
+        c1 = min(nspat - 1, int(right[k]))
+        if c1 < c0:
+            continue
+        aperture_width_pixels[k] = c1 - c0 + 1
+        raw_sum = np.nansum(arr[:, d, c0 : c1 + 1], axis=1)
+
+        if subtract_background:
+            bg_cols = np.zeros(nspat, dtype=bool)
+            left_bg_lo = max(0, c0 - int(background_inner_gap) - int(background_width))
+            left_bg_hi = c0 - int(background_inner_gap) - 1
+            right_bg_lo = c1 + int(background_inner_gap) + 1
+            right_bg_hi = min(nspat - 1, c1 + int(background_inner_gap) + int(background_width))
+            if left_bg_hi >= left_bg_lo:
+                bg_cols[left_bg_lo : left_bg_hi + 1] = True
+            if right_bg_hi >= right_bg_lo:
+                bg_cols[right_bg_lo : right_bg_hi + 1] = True
+            if bg_mask is not None:
+                bg_cols &= ~bg_mask[d]
+            if np.any(bg_cols):
+                bg_values = arr[:, d, bg_cols]
+                valid_counts = np.sum(np.isfinite(bg_values), axis=1)
+                bg_level = np.nanmedian(bg_values, axis=1)
+                bg_level = np.where(np.isfinite(bg_level), bg_level, 0.0)
+                background_per_pixel[:, k] = bg_level
+                background_counts[:, k] = valid_counts.astype(int)
+                spectra[:, k] = raw_sum - bg_level * aperture_width_pixels[k]
+            else:
+                spectra[:, k] = raw_sum
+        else:
+            spectra[:, k] = raw_sum
+
+    if return_diagnostics:
+        return spectra, disp, {
+            "background_per_pixel": background_per_pixel,
+            "background_counts": background_counts,
+            "aperture_width_pixels": aperture_width_pixels,
+        }
+    return spectra, disp
+
+
+def build_channel_quality_mask(aperture_model, bad_pixel_mask):
+    """Return a per-channel good-pixel flag from a 2D bad-pixel map.
+
+    Parameters
+    ----------
+    aperture_model : dict
+        Output of ``build_linear_trace_aperture``.
+    bad_pixel_mask : 2D bool array, shape (n_dispersion, n_spatial)
+        True where a detector pixel is bad / unreliable.
+
+    Returns
+    -------
+    channel_good : 1D bool array, shape (n_channels,)
+        True → channel is clean; False → contains at least one bad pixel.
     """
-    nint, ngroup, nx, ny = ramp_cube.shape
-    slope_cube = np.zeros((nint, nx, ny), dtype=np.float32)
-    
-    # Pre-calculate delta times
-    dt = np.empty(ngroup - 1, dtype=np.float32)
-    for g in range(ngroup - 1):
-        dt[g] = times[g+1] - times[g]
-        
-    # prange enables multi-threading on the outermost loop (Integrations)
-    for i in prange(nint):
-        for x in range(nx):
-            for y in range(ny):
-                
-                # --- 1. Extract 1D Ramp ---
-                counts = np.empty(ngroup, dtype=np.float32)
-                for g in range(ngroup):
-                    counts[g] = ramp_cube[i, g, x, y]
-                    
-                # --- 2. CR Rejection (Two-point diff & MAD) ---
-                rates = np.empty(ngroup - 1, dtype=np.float32)
-                for g in range(ngroup - 1):
-                    rates[g] = (counts[g+1] - counts[g]) / dt[g]
-                    
-                # Numba fully supports numpy median operations
-                med_rate = np.median(rates)
-                
-                abs_devs = np.empty(ngroup - 1, dtype=np.float32)
-                for g in range(ngroup - 1):
-                    abs_devs[g] = np.abs(rates[g] - med_rate)
-                mad = np.median(abs_devs)
-                
-                sigma = mad * 1.4826
-                if sigma < 1e-6:
-                    # Fallback to standard deviation if the ramp is perfectly noiseless
-                    sigma = np.std(rates) + 1e-6
-                    
-                # Apply Corrections
-                corrected_counts = counts.copy()
-                for g in range(ngroup - 1):
-                    if np.abs(rates[g] - med_rate) > (threshold * sigma):
-                        expected_diff = med_rate * dt[g]
-                        actual_diff = counts[g+1] - counts[g]
-                        excess = actual_diff - expected_diff
-                        
-                        # Subtract excess from all subsequent groups
-                        for k in range(g+1, ngroup):
-                            corrected_counts[k] -= excess
-                            
-                # --- 3. Optimally Weighted Least Squares (OWLS) ---
-                sum_w = 0.0
-                sum_wx = 0.0
-                sum_wy = 0.0
-                sum_wxx = 0.0
-                sum_wxy = 0.0
-                
-                for g in range(ngroup):
-                    t = times[g]
-                    c = corrected_counts[g]
-                    
-                    # Inverse-variance weighting
-                    # Variance = Read Noise^2 + Poisson Noise (Signal / Gain)
-                    variance = (read_noise ** 2) + (max(c, 0.0) / gain)
-                    w = 1.0 / variance
-                    
-                    sum_w += w
-                    sum_wx += w * t
-                    sum_wy += w * c
-                    sum_wxx += w * t * t
-                    sum_wxy += w * t * c
-                    
-                delta = (sum_w * sum_wxx) - (sum_wx * sum_wx)
-                
-                if delta != 0.0:
-                    slope_cube[i, x, y] = (sum_w * sum_wxy - sum_wx * sum_wy) / delta
-                else:
-                    slope_cube[i, x, y] = 0.0
-                    
-    return slope_cube
+    mask = np.asarray(bad_pixel_mask, dtype=bool)
+    disp = aperture_model["dispersion_pixels"]
+    left = aperture_model["spatial_left_int"]
+    right = aperture_model["spatial_right_int"]
+    n_channels = len(disp)
+    channel_good = np.ones(n_channels, dtype=bool)
+    n_spatial = mask.shape[1]
+    for k in range(n_channels):
+        d = int(disp[k])
+        c_lo = max(0, int(left[k]))
+        c_hi = min(n_spatial - 1, int(right[k]))
+        if np.any(mask[d, c_lo : c_hi + 1]):
+            channel_good[k] = False
+    return channel_good
+
+
+def compute_aperture_motion_centroids(
+    cube,
+    aperture_model,
+    background_per_pixel=None,
+    bad_pixel_mask=None,
+    guard_pixels=2,
+):
+    """Estimate spatial/dispersion centroids from an aperture trace footprint.
+
+    Parameters
+    ----------
+    cube : 3D array, shape (n_int, n_dispersion, n_spatial)
+    aperture_model : dict
+        Output of ``build_linear_trace_aperture``.
+    background_per_pixel : 2D array (n_int, n_channels) or None
+        Background level per pixel per integration (from extraction diagnostics).
+    bad_pixel_mask : 2D bool array (n_dispersion, n_spatial) or None
+    guard_pixels : int
+        Extra pixels beyond aperture edge included in centroid computation.
+
+    Returns
+    -------
+    dict with keys ``spatial_centroid`` and ``dispersion_centroid``,
+    each a 1D array of length n_int.
+    """
+    arr = np.asarray(cube, dtype=float)
+    if arr.ndim != 3:
+        raise ValueError(f"cube must be 3D, got {arr.shape}.")
+
+    disp = np.asarray(aperture_model["dispersion_pixels"], dtype=int)
+    left = np.asarray(aperture_model["spatial_left_int"], dtype=int)
+    right = np.asarray(aperture_model["spatial_right_int"], dtype=int)
+    if not (disp.size == left.size == right.size):
+        raise ValueError("Aperture model arrays must have matching lengths.")
+
+    nint, ndisp, nspat = arr.shape
+    bg = (
+        np.zeros((nint, disp.size), dtype=float)
+        if background_per_pixel is None
+        else np.asarray(background_per_pixel, dtype=float)
+    )
+    if bg.shape != (nint, disp.size):
+        raise ValueError(
+            f"background_per_pixel must have shape {(nint, disp.size)}, got {bg.shape}."
+        )
+
+    mask = (
+        np.zeros((ndisp, nspat), dtype=bool)
+        if bad_pixel_mask is None
+        else np.asarray(bad_pixel_mask, dtype=bool)
+    )
+
+    spatial_centroid = np.full(nint, np.nan, dtype=float)
+    dispersion_centroid = np.full(nint, np.nan, dtype=float)
+    guard = int(guard_pixels)
+
+    for i in range(nint):
+        frame = arr[i]
+        row_weights = np.zeros(disp.size, dtype=float)
+        x_num, x_den = 0.0, 0.0
+        for k, d in enumerate(disp):
+            if d < 0 or d >= ndisp:
+                continue
+            l = max(0, int(left[k]) - guard)
+            r = min(nspat - 1, int(right[k]) + guard)
+            vals = frame[d, l : r + 1]
+            good = np.isfinite(vals) & (~mask[d, l : r + 1])
+            if not np.any(good):
+                continue
+            weights = np.where(good, vals - bg[i, k], 0.0)
+            weights = np.clip(weights, 0.0, None)
+            wsum = float(np.sum(weights))
+            if wsum <= 0:
+                continue
+            x = np.arange(l, r + 1, dtype=float)
+            x_num += float(np.sum(weights * x))
+            x_den += wsum
+            row_weights[k] = wsum
+        if x_den > 0:
+            spatial_centroid[i] = x_num / x_den
+        if np.sum(row_weights) > 0:
+            dispersion_centroid[i] = np.sum(row_weights * disp) / np.sum(row_weights)
+
+    return {
+        "spatial_centroid": spatial_centroid,
+        "dispersion_centroid": dispersion_centroid,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+def _robust_mad_sigma(x):
+    """Return (median, robust-sigma) for a 1-D array using 1.4826*MAD."""
+    x = np.asarray(x, dtype=float)
+    med = np.nanmedian(x)
+    mad = np.nanmedian(np.abs(x - med))
+    sig = 1.4826 * mad
+    if (not np.isfinite(sig)) or sig <= 0:
+        sig = np.nanstd(x)
+    return med, max(float(sig), 1.0e-12)
+
+
+def _pad_mask(mask, pad=1):
+    """Extend False regions in a boolean mask by *pad* samples on each side."""
+    mask = np.asarray(mask, dtype=bool).copy()
+    if pad <= 0:
+        return mask
+    for idx in np.where(~mask)[0]:
+        lo = max(0, idx - pad)
+        hi = min(mask.size, idx + pad + 1)
+        mask[lo:hi] = False
+    return mask
+
+
+# ---------------------------------------------------------------------------
+# Photometric time-series helpers
+# ---------------------------------------------------------------------------
+
+def compute_white_light_products(
+    extracted_spectra_masked,
+    extraction_info,
+    exposure_time_s,
+    nint,
+    ngroup,
+    transit_ingress_index=0,
+    transit_egress_index=None,
+):
+    """Compute white-light curve and per-channel statistics from masked spectra."""
+    if transit_egress_index is None:
+        transit_egress_index = nint - 1
+
+    if exposure_time_s is not None and exposure_time_s.size == nint * ngroup:
+        trial = exposure_time_s.reshape(nint, ngroup)[:, -1]
+        if np.nanmax(trial) > np.nanmin(trial):
+            integration_time_axis = trial
+            time_axis_label = "Ramp end time [s]"
+        else:
+            integration_time_axis = np.arange(nint, dtype=float)
+            time_axis_label = "Integration index"
+    else:
+        integration_time_axis = np.arange(nint, dtype=float)
+        time_axis_label = "Integration index"
+
+    oot_mask = np.ones(nint, dtype=bool)
+    oot_mask[int(transit_ingress_index) : int(transit_egress_index) + 1] = False
+
+    white_light = np.nansum(extracted_spectra_masked, axis=1)
+    white_light_norm = white_light / np.nanmedian(white_light)
+    median_spectrum = np.nanmedian(extracted_spectra_masked, axis=0)
+    normalized_spectra = extracted_spectra_masked / median_spectrum[None, :]
+    spectral_scatter_ppm = 1.0e6 * np.nanstd(normalized_spectra, axis=0)
+    median_background_per_pixel = np.nanmedian(
+        extraction_info["background_per_pixel"], axis=0
+    )
+
+    return {
+        "integration_time_axis": integration_time_axis,
+        "time_axis_label": time_axis_label,
+        "oot_mask": oot_mask,
+        "white_light": white_light,
+        "white_light_norm": white_light_norm,
+        "median_spectrum": median_spectrum,
+        "normalized_spectra": normalized_spectra,
+        "spectral_scatter_ppm": spectral_scatter_ppm,
+        "median_background_per_pixel": median_background_per_pixel,
+    }
+
+
+def reject_photometric_excursions(
+    white_light_norm,
+    dx,
+    dy,
+    oot_mask,
+    flux_window_low=0.97,
+    flux_window_high=1.03,
+    excursion_sigma=6.0,
+    excursion_padding=1,
+    motion_sigma=6.0,
+):
+    """Flag integrations with flux excursions or large pointing jumps."""
+    wl = np.asarray(white_light_norm, dtype=float)
+    n = wl.size
+
+    diff_wl = np.diff(wl, prepend=wl[0])
+    trend = np.array(
+        [float(np.nanmedian(wl[max(0, i - 4) : min(n, i + 5)])) for i in range(n)]
+    )
+    resid_wl = wl - trend
+
+    wl_med, wl_sig = _robust_mad_sigma(resid_wl[oot_mask])
+    dw_med, dw_sig = _robust_mad_sigma(diff_wl[oot_mask])
+
+    motion_delta = np.sqrt(np.diff(dx, prepend=dx[0]) ** 2 + np.diff(dy, prepend=dy[0]) ** 2)
+    motion_med, motion_sig_val = _robust_mad_sigma(motion_delta[oot_mask])
+
+    keep = np.isfinite(wl)
+    keep &= wl >= float(flux_window_low)
+    keep &= wl <= float(flux_window_high)
+    keep &= np.abs(resid_wl - wl_med) <= float(excursion_sigma) * wl_sig
+    keep &= np.abs(diff_wl - dw_med) <= float(excursion_sigma) * dw_sig
+    keep &= motion_delta <= motion_med + float(motion_sigma) * motion_sig_val
+    keep = _pad_mask(keep, pad=int(excursion_padding))
+    return keep
+
+
+# ---------------------------------------------------------------------------
+# Plotting functions
+# ---------------------------------------------------------------------------
+
+def plot_spatial_profile(trace_est, trace_params):
+    """Plot the collapsed spatial profile used to establish the trace aperture."""
+    spat_x = np.arange(trace_est["profile_smooth"].size)
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(spat_x, trace_est["profile"], alpha=0.5, label="Raw profile")
+    ax.plot(spat_x, trace_est["profile_smooth"], lw=2, label="Smoothed profile")
+    ax.axvline(trace_params["spatial_left_start"], color="r", ls="--", label="Start bounds")
+    ax.axvline(trace_params["spatial_right_start"], color="r", ls="--")
+    ax.axvline(trace_params["spatial_left_end"], color="orange", ls=":", label="End bounds")
+    ax.axvline(trace_params["spatial_right_end"], color="orange", ls=":")
+    ax.axhline(trace_est["threshold"], color="k", ls=":", label="Threshold")
+    for peak in trace_est["peak_positions"]:
+        ax.axvline(peak, color="g", ls="-.", alpha=0.8)
+    ax.set_xlabel("Spatial pixel")
+    ax.set_ylabel("Collapsed slope signal")
+    ax.set_title("Global Spatial Profile and Variable Aperture Priors")
+    ax.legend(loc="best", fontsize=9)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_aperture_overlay(slope_cube, aperture_model, trace_est, image_index=20):
+    """Overlay the variable aperture bounds on a single slope integration."""
+    image_index = min(image_index, slope_cube.shape[0] - 1)
+    img = slope_cube[image_index]
+    finite = np.isfinite(img)
+    vmin = float(np.nanpercentile(img[finite], 5)) if np.any(finite) else 0.0
+    vmax = float(np.nanpercentile(img[finite], 99.5)) if np.any(finite) else 1.0
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.imshow(img, origin="lower", aspect="auto", vmin=vmin, vmax=vmax, cmap="viridis")
+    ax.plot(
+        aperture_model["spatial_left"],
+        aperture_model["dispersion_pixels"],
+        color="r",
+        lw=1.8,
+        ls="--",
+        label="Variable aperture",
+    )
+    ax.plot(
+        aperture_model["spatial_right"],
+        aperture_model["dispersion_pixels"],
+        color="r",
+        lw=1.8,
+        ls="--",
+    )
+    for peak in trace_est["peak_positions"]:
+        ax.axvline(peak, color="cyan", ls="-.", lw=1.2, alpha=0.8, label="Detected peak")
+    ax.set_xlim(0, img.shape[1] - 1)
+    ax.set_ylim(0, img.shape[0] - 1)
+    ax.set_xlabel("Spatial pixel")
+    ax.set_ylabel("Dispersion pixel")
+    ax.set_title(f"Trace/Aperture Overlay on Corrected Slope Image (integration {image_index})")
+    ax.legend(loc="upper right", fontsize=8)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_spectrophotometry_diagnostics(
+    extracted_dispersion,
+    median_spectrum,
+    channel_good,
+    integration_time_axis,
+    white_light_norm,
+    white_light_clean,
+    median_background_per_pixel,
+    normalized_spectra,
+    dx,
+    oot_mask,
+    spectral_scatter_ppm,
+    time_axis_label,
+):
+    """Generate a six-panel spectrophotometry diagnostic figure."""
+    n_bad_channels = int(np.sum(~channel_good))
+    time_lo = float(np.nanmin(integration_time_axis))
+    time_hi = float(np.nanmax(integration_time_axis))
+    if time_hi <= time_lo:
+        time_hi = time_lo + 1.0
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
+
+    ax = axes[0, 0]
+    ax.plot(extracted_dispersion, median_spectrum, color="tab:blue", lw=1.5)
+    for bd in extracted_dispersion[~channel_good]:
+        ax.axvline(bd, color="red", lw=0.8, alpha=0.5)
+    ax.set_xlabel("Dispersion pixel")
+    ax.set_ylabel("Median aperture flux")
+    ax.set_title(f"Median Extracted Spectrum ({n_bad_channels} bad ch. marked red)")
+
+    ax = axes[0, 1]
+    ax.plot(integration_time_axis, white_light_norm, marker=".", lw=1, color="0.55", label="All integrations")
+    ax.plot(integration_time_axis, white_light_clean, lw=1.2, color="tab:green", label="Kept integrations")
+    in_transit = (~oot_mask) & np.isfinite(white_light_norm)
+    if np.any(in_transit):
+        t_in = integration_time_axis[in_transit]
+        f_in = white_light_norm[in_transit]
+        ax.scatter(
+            t_in,
+            f_in,
+            s=16,
+            color="tab:orange",
+            edgecolor="none",
+            alpha=0.9,
+            label="In-transit (raw)",
+            zorder=4,
+        )
+        ax.axvspan(np.nanmin(t_in), np.nanmax(t_in), color="tab:orange", alpha=0.12)
+    ax.axhline(1.0, color="k", ls=":", lw=1)
+    ax.set_xlabel(time_axis_label)
+    ax.set_ylabel("Normalized white-light flux")
+    ax.set_title("White-light Curve")
+    ax.set_ylim(0.97, 1.03)
+    ax.legend(loc="best", fontsize=8)
+
+    ax = axes[0, 2]
+    ax.plot(extracted_dispersion, median_background_per_pixel, color="tab:orange", lw=1.5)
+    ax.set_xlabel("Dispersion pixel")
+    ax.set_ylabel("Background per pixel")
+    ax.set_title("Local Background Spectrum")
+
+    ax = axes[1, 0]
+    im = ax.imshow(
+        normalized_spectra,
+        origin="lower",
+        aspect="auto",
+        extent=[extracted_dispersion[0], extracted_dispersion[-1], time_lo, time_hi],
+        vmin=0.97,
+        vmax=1.03,
+        cmap="magma",
+    )
+    ax.set_xlabel("Dispersion pixel")
+    ax.set_ylabel(time_axis_label)
+    ax.set_title("Normalized Spectral Time Series")
+    fig.colorbar(im, ax=ax, label="Relative flux")
+
+    ax = axes[1, 1]
+    ax.scatter(
+        dx,
+        white_light_norm - np.nanmedian(white_light_norm[oot_mask]),
+        s=12,
+        alpha=0.6,
+        color="tab:purple",
+    )
+    ax.axhline(0.0, color="k", ls=":", lw=1)
+    ax.set_xlabel("dx [pix]")
+    ax.set_ylabel("White-light residual")
+    ax.set_title("Pointing Correlation Diagnostic")
+
+    ax = axes[1, 2]
+    ax.plot(extracted_dispersion, spectral_scatter_ppm, color="0.55", lw=1.0)
+    for bd in extracted_dispersion[~channel_good]:
+        ax.axvline(bd, color="red", lw=0.8, alpha=0.5, ls="--")
+    ax.set_xlabel("Dispersion pixel")
+    ax.set_ylabel("Scatter [ppm]")
+    ax.set_title("Per-channel Temporal Scatter")
+
+    plt.show()
+
+
+def plot_flux_motion_correlation(dx, dy, white_light_norm, integration_time_axis, time_axis_label):
+    """Scatter plot of flux versus pointing motion radius."""
+    motion_radius = np.maximum(np.sqrt(dx * dx + dy * dy), 1.0e-6)
+    finite = np.isfinite(motion_radius) & np.isfinite(white_light_norm)
+
+    fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
+    sc = ax.scatter(
+        motion_radius[finite],
+        white_light_norm[finite],
+        s=14,
+        alpha=0.7,
+        c=integration_time_axis[finite],
+        cmap="viridis",
+    )
+    fig.colorbar(sc, ax=ax, label=time_axis_label)
+    ax.set_xscale("log")
+    ax.set_xlabel("Motion radius sqrt(dx^2 + dy^2) [pix] (log)")
+    ax.set_ylabel("Normalized white-light flux")
+    ax.set_ylim(0.97, 1.03)
+    ax.set_title("Flux-Motion Correlation")
+    ax.grid(True, which="both", ls=":", alpha=0.4)
+    plt.show()
+
+
+def _convolve1d_same_axis(image_2d, kernel_1d, axis):
+    """Convolve a 2D image with a 1D kernel along one axis using edge padding."""
+    arr = np.asarray(image_2d, dtype=float)
+    ker = np.asarray(kernel_1d, dtype=float).reshape(-1)
+    if arr.ndim != 2:
+        raise ValueError(f"image_2d must be 2D, got {arr.shape}.")
+    if ker.size < 3 or (ker.size % 2) != 1:
+        raise ValueError("kernel_1d must have odd length >= 3.")
+    if axis not in (0, 1):
+        raise ValueError("axis must be 0 or 1.")
+
+    pad = ker.size // 2
+    out = np.zeros_like(arr, dtype=float)
+    if axis == 0:
+        padded = np.pad(arr, ((pad, pad), (0, 0)), mode="edge")
+        for j, coeff in enumerate(ker):
+            out += coeff * padded[j : j + arr.shape[0], :]
+    else:
+        padded = np.pad(arr, ((0, 0), (pad, pad)), mode="edge")
+        for j, coeff in enumerate(ker):
+            out += coeff * padded[:, j : j + arr.shape[1]]
+    return out
+
+
+def estimate_difference_image_shifts(
+    cube,
+    reference_image=None,
+    bad_pixel_mask=None,
+    kernel_dx=(-0.5, 0.0, 0.5),
+    kernel_dy=(-0.5, 0.0, 0.5),
+    background_order=1,
+    clip_sigma=8.0,
+    min_valid_pixels=1000,
+):
+    """Estimate per-integration dx/dy from difference images.
+
+    The model solves, per integration,
+    ``frame - reference ~= a*grad_x + b*grad_y + background_terms``
+    then reports ``dx=-a`` and ``dy=-b``.  Background terms include a constant
+    and, when ``background_order>=1``, a linear plane (x and y terms).
+    """
+    arr = np.asarray(cube, dtype=float)
+    if arr.ndim != 3:
+        raise ValueError(f"cube must be 3D, got {arr.shape}.")
+    nint, nrow, ncol = arr.shape
+
+    if reference_image is None:
+        ref = np.nanmedian(arr, axis=0)
+    else:
+        ref = np.asarray(reference_image, dtype=float)
+        if ref.shape != (nrow, ncol):
+            raise ValueError(f"reference_image must have shape {(nrow, ncol)}, got {ref.shape}.")
+
+    if bad_pixel_mask is None:
+        bad = np.zeros((nrow, ncol), dtype=bool)
+    else:
+        bad = np.asarray(bad_pixel_mask, dtype=bool)
+        if bad.shape != (nrow, ncol):
+            raise ValueError(f"bad_pixel_mask must have shape {(nrow, ncol)}, got {bad.shape}.")
+
+    gx = _convolve1d_same_axis(ref, kernel_dx, axis=1)
+    gy = _convolve1d_same_axis(ref, kernel_dy, axis=0)
+
+    yy, xx = np.indices((nrow, ncol), dtype=float)
+    xnorm = (xx - 0.5 * (ncol - 1)) / max(1.0, 0.5 * (ncol - 1))
+    ynorm = (yy - 0.5 * (nrow - 1)) / max(1.0, 0.5 * (nrow - 1))
+
+    dx = np.full(nint, np.nan, dtype=float)
+    dy = np.full(nint, np.nan, dtype=float)
+    bg0 = np.full(nint, np.nan, dtype=float)
+    bgx = np.full(nint, np.nan, dtype=float)
+    bgy = np.full(nint, np.nan, dtype=float)
+    residual_rms = np.full(nint, np.nan, dtype=float)
+    n_valid = np.zeros(nint, dtype=int)
+
+    base_valid = np.isfinite(ref) & np.isfinite(gx) & np.isfinite(gy) & (~bad)
+
+    for i in range(nint):
+        diff = arr[i] - ref
+        valid = base_valid & np.isfinite(diff)
+
+        if clip_sigma is not None and np.any(valid):
+            med = np.nanmedian(diff[valid])
+            mad = np.nanmedian(np.abs(diff[valid] - med))
+            sig = 1.4826 * mad
+            if np.isfinite(sig) and sig > 0:
+                valid &= np.abs(diff - med) <= float(clip_sigma) * sig
+
+        n_valid[i] = int(np.sum(valid))
+        if n_valid[i] < max(int(min_valid_pixels), 8):
+            continue
+
+        cols = [gx[valid], gy[valid], np.ones(n_valid[i], dtype=float)]
+        if int(background_order) >= 1:
+            cols.append(xnorm[valid])
+            cols.append(ynorm[valid])
+        A = np.column_stack(cols)
+        b = diff[valid]
+
+        if A.shape[0] <= A.shape[1]:
+            continue
+
+        beta, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        model = A @ beta
+        resid = b - model
+
+        dx[i] = -float(beta[0])
+        dy[i] = -float(beta[1])
+        bg0[i] = float(beta[2])
+        if int(background_order) >= 1:
+            bgx[i] = float(beta[3])
+            bgy[i] = float(beta[4])
+        residual_rms[i] = float(np.nanstd(resid))
+
+    return {
+        "dx": dx,
+        "dy": dy,
+        "background_offset": bg0,
+        "background_x": bgx,
+        "background_y": bgy,
+        "residual_rms": residual_rms,
+        "n_valid_pixels": n_valid,
+        "reference_image": ref,
+        "gradient_x": gx,
+        "gradient_y": gy,
+    }
+
+
+def plot_difference_imaging_motion(
+    integration_time_axis,
+    dx_diff,
+    dy_diff,
+    oot_mask=None,
+    dx_reference=None,
+    dy_reference=None,
+    reference_label="Aperture-centroid motion",
+):
+    """Plot difference-imaging dx/dy with optional comparison motion series."""
+    t = np.asarray(integration_time_axis, dtype=float)
+    dx_arr = np.asarray(dx_diff, dtype=float)
+    dy_arr = np.asarray(dy_diff, dtype=float)
+    if t.shape != dx_arr.shape or t.shape != dy_arr.shape:
+        raise ValueError("integration_time_axis, dx_diff, and dy_diff must have matching shapes.")
+
+    if oot_mask is None:
+        oot = np.ones_like(dx_arr, dtype=bool)
+    else:
+        oot = np.asarray(oot_mask, dtype=bool)
+        if oot.shape != dx_arr.shape:
+            raise ValueError("oot_mask must match the shape of dx_diff.")
+    in_tr = ~oot
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True, constrained_layout=True)
+
+    ax = axes[0]
+    ax.plot(t, dx_arr, color="tab:blue", lw=1.2, label="Difference imaging")
+    if np.any(in_tr):
+        ax.scatter(t[in_tr], dx_arr[in_tr], s=14, color="tab:orange", alpha=0.85, label="In-transit")
+    if dx_reference is not None:
+        dx_ref = np.asarray(dx_reference, dtype=float)
+        if dx_ref.shape == dx_arr.shape:
+            ax.plot(t, dx_ref, color="0.45", lw=1.0, ls="--", label=reference_label)
+    ax.axhline(0.0, color="k", lw=1, ls=":")
+    ax.set_ylabel("dx [pix]")
+    ax.set_title("Difference-Image Motion: dx")
+    ax.legend(loc="best", fontsize=8)
+
+    ax = axes[1]
+    ax.plot(t, dy_arr, color="tab:green", lw=1.2, label="Difference imaging")
+    if np.any(in_tr):
+        ax.scatter(t[in_tr], dy_arr[in_tr], s=14, color="tab:orange", alpha=0.85, label="In-transit")
+    if dy_reference is not None:
+        dy_ref = np.asarray(dy_reference, dtype=float)
+        if dy_ref.shape == dy_arr.shape:
+            ax.plot(t, dy_ref, color="0.45", lw=1.0, ls="--", label=reference_label)
+    ax.axhline(0.0, color="k", lw=1, ls=":")
+    ax.set_xlabel("Time / integration")
+    ax.set_ylabel("dy [pix]")
+    ax.set_title("Difference-Image Motion: dy")
+    ax.legend(loc="best", fontsize=8)
+
+    plt.show()

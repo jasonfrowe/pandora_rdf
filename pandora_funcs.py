@@ -284,61 +284,223 @@ def detect_bad_pixel_clumps_from_ramp_fit(
 
 
 def correct_bad_pixels_with_neighbors(
-	cube,
-	bad_mask,
-	max_radius=3,
-	min_neighbors=4,
+    cube,
+    bad_mask,
+    max_radius=3,
+    min_neighbors=4,
+    method="local_plane",
+    sigma_clip=3.5,
 ):
-	"""Replace bad pixels/clumps with local robust neighbor medians per frame."""
-	arr = np.asarray(cube, dtype=float)
-	if arr.ndim != 3:
-		raise ValueError(f"cube must be 3D, got shape {arr.shape}.")
+    """Replace bad pixels/clumps using neighbor-based interpolation per frame.
 
-	mask = np.asarray(bad_mask, dtype=bool)
-	if mask.shape != arr.shape[1:]:
-		raise ValueError(
-			f"bad_mask shape {mask.shape} must match image plane {arr.shape[1:]}."
-		)
+    The default method fits a local plane to neighboring good pixels with
+    robust clipping, then evaluates the model at the bad pixel location.
+    This avoids bias from bright trace pixels that can contaminate simple
+    patch medians.
+    """
+    arr = np.asarray(cube, dtype=float)
+    if arr.ndim != 3:
+        raise ValueError(f"cube must be 3D, got shape {arr.shape}.")
 
-	if not np.any(mask):
-		return arr.copy(), {"n_fixed": 0, "fixed_fraction": 0.0}
+    mask = np.asarray(bad_mask, dtype=bool)
+    if mask.shape != arr.shape[1:]:
+        raise ValueError(
+            f"bad_mask shape {mask.shape} must match image plane {arr.shape[1:]}."
+        )
 
-	ny, nx = mask.shape
-	idx = np.argwhere(mask)
-	corrected = arr.copy()
-	n_fixed = 0
+    if not np.any(mask):
+        return arr.copy(), {"n_fixed": 0, "fixed_fraction": 0.0}
 
-	for f in range(corrected.shape[0]):
-		frame = corrected[f]
-		for r, c in idx:
-			filled = False
-			for rad in range(1, max(1, int(max_radius)) + 1):
-				r0 = max(0, r - rad)
-				r1 = min(ny, r + rad + 1)
-				c0 = max(0, c - rad)
-				c1 = min(nx, c + rad + 1)
+    ny, nx = mask.shape
+    idx = np.argwhere(mask)
+    corrected = arr.copy()
+    n_fixed = 0
+    n_plane = 0
+    n_fallback = 0
+    method_name = str(method).strip().lower()
 
-				patch = frame[r0:r1, c0:c1]
-				patch_mask = mask[r0:r1, c0:c1]
-				vals = patch[~patch_mask]
-				vals = vals[np.isfinite(vals)]
+    for f in range(corrected.shape[0]):
+        frame = corrected[f]
+        for r, c in idx:
+            filled = False
+            for rad in range(1, max(1, int(max_radius)) + 1):
+                r0 = max(0, r - rad)
+                r1 = min(ny, r + rad + 1)
+                c0 = max(0, c - rad)
+                c1 = min(nx, c + rad + 1)
 
-				if vals.size >= min_neighbors:
-					frame[r, c] = float(np.median(vals))
-					filled = True
-					n_fixed += 1
-					break
+                patch = frame[r0:r1, c0:c1]
+                patch_mask = mask[r0:r1, c0:c1]
 
-			if not filled:
-				frame[r, c] = np.nan
+                yy, xx = np.mgrid[r0:r1, c0:c1]
+                dx = (xx - c).astype(float)
+                dy = (yy - r).astype(float)
+                ring = np.maximum(np.abs(dx), np.abs(dy)) == float(rad)
 
-		corrected[f] = frame
+                good = (~patch_mask) & np.isfinite(patch) & ring
+                if np.count_nonzero(good) < min_neighbors:
+                    continue
 
-	info = {
-		"n_fixed": int(n_fixed),
-		"fixed_fraction": float(n_fixed / (mask.sum() * corrected.shape[0])),
-	}
-	return corrected, info
+                vals = patch[good].astype(float)
+                dxv = dx[good]
+                dyv = dy[good]
+
+                # Robust clip to suppress bright-trace contamination in local neighborhoods.
+                med = float(np.median(vals))
+                mad = float(np.median(np.abs(vals - med)))
+                if mad > 0:
+                    sig = 1.4826 * mad
+                    keep = np.abs(vals - med) <= float(sigma_clip) * sig
+                else:
+                    keep = np.ones(vals.size, dtype=bool)
+
+                if np.count_nonzero(keep) < min_neighbors:
+                    continue
+
+                vals_fit = vals[keep]
+                dx_fit = dxv[keep]
+                dy_fit = dyv[keep]
+
+                interp_val = np.nan
+                if method_name == "local_plane":
+                    # z = a + b*dx + c*dy evaluated at (0, 0) => a
+                    A = np.column_stack(
+                        [np.ones(vals_fit.size, dtype=float), dx_fit, dy_fit]
+                    )
+                    dist2 = dx_fit * dx_fit + dy_fit * dy_fit
+                    w = 1.0 / (1.0 + dist2)
+                    Aw = A * np.sqrt(w)[:, None]
+                    bw = vals_fit * np.sqrt(w)
+                    try:
+                        coef, _, _, _ = np.linalg.lstsq(Aw, bw, rcond=None)
+                        if coef.size >= 1 and np.isfinite(coef[0]):
+                            interp_val = float(coef[0])
+                    except Exception:
+                        interp_val = np.nan
+
+                if not np.isfinite(interp_val):
+                    # Fallback: inverse-distance weighted mean of robust neighbors.
+                    dist2 = dx_fit * dx_fit + dy_fit * dy_fit
+                    w = 1.0 / np.maximum(1.0, dist2)
+                    den = float(np.sum(w))
+                    if den > 0 and np.isfinite(den):
+                        interp_val = float(np.sum(w * vals_fit) / den)
+                        n_fallback += 1
+
+                if np.isfinite(interp_val):
+                    frame[r, c] = interp_val
+                    filled = True
+                    n_fixed += 1
+                    if method_name == "local_plane":
+                        n_plane += 1
+                    break
+
+            if not filled:
+                frame[r, c] = np.nan
+
+        corrected[f] = frame
+
+    info = {
+        "n_fixed": int(n_fixed),
+        "fixed_fraction": float(n_fixed / (mask.sum() * corrected.shape[0])),
+        "method": method_name,
+        "n_plane": int(n_plane),
+        "n_fallback": int(n_fallback),
+    }
+    return corrected, info
+
+
+def correct_detector_edge_pixels(
+    cube,
+    n_spatial_edge_rows=3,
+    spatial_low=0,
+    spatial_high=79,
+    dispersion_low=0,
+    dispersion_high=None,
+):
+    """Correct detector edge artifacts in detector coordinates per frame.
+
+    Applied per frame in two passes:
+    1. Replace spatial edge rows (y = 0..N-1 and y = y_max-N+1..y_max)
+       across all dispersion x using per-x spatial medians from interior y.
+    2. Replace dispersion edge columns (x = x_low and x = x_high)
+       across all spatial y using per-y dispersion means from interior x.
+    """
+    arr = np.asarray(cube, dtype=float)
+    if arr.ndim != 3:
+        raise ValueError(f"cube must be 3D, got shape {arr.shape}.")
+
+    corrected = arr.copy()
+    nint, ndisp, nspat = corrected.shape
+
+    s_lo = int(spatial_low)
+    s_hi = int(spatial_high)
+    if s_lo < 0 or s_lo >= nspat or s_hi < 0 or s_hi >= nspat:
+        raise ValueError(f"spatial_low/spatial_high must be in [0, {nspat - 1}].")
+    if s_hi <= s_lo:
+        raise ValueError("spatial_high must be > spatial_low.")
+
+    x_lo = int(dispersion_low)
+    x_hi = int(ndisp - 1 if dispersion_high is None else dispersion_high)
+    if x_lo < 0 or x_lo >= ndisp or x_hi < 0 or x_hi >= ndisp:
+        raise ValueError(f"dispersion_low/dispersion_high must be in [0, {ndisp - 1}].")
+    if x_hi <= x_lo:
+        raise ValueError("dispersion_high must be > dispersion_low.")
+
+    ner = max(0, int(n_spatial_edge_rows))
+    if ner * 2 >= (s_hi - s_lo + 1):
+        raise ValueError("n_spatial_edge_rows must be less than half the spatial span.")
+
+    # Spatial interior used for x-wise medians (exclude top/bottom spatial edges).
+    s_in_lo = s_lo + ner
+    s_in_hi = s_hi - ner + 1
+    if s_in_hi <= s_in_lo:
+        raise ValueError("No interior spatial rows available for median replacement.")
+
+    # Dispersion interior used for y-wise means (exclude x edge columns).
+    x_in_lo = x_lo + 1
+    x_in_hi = x_hi
+    if x_in_hi <= x_in_lo:
+        raise ValueError("No interior dispersion columns available for mean replacement.")
+
+    top_rows = np.arange(s_lo, s_lo + ner, dtype=int)
+    bottom_rows = np.arange(s_hi - ner + 1, s_hi + 1, dtype=int)
+    edge_spatial_rows = np.r_[top_rows, bottom_rows]
+
+    n_replaced_spatial_median = 0
+    n_replaced_dispersion_mean = 0
+
+    for f in range(nint):
+        frame = corrected[f]
+
+        # Pass 1: set y-edge rows from per-x medians across interior spatial rows.
+        x_medians = np.nanmedian(frame[:, s_in_lo:s_in_hi], axis=1)
+        finite_x = np.isfinite(x_medians)
+        if edge_spatial_rows.size > 0 and np.any(finite_x):
+            frame[np.ix_(finite_x, edge_spatial_rows)] = x_medians[finite_x][:, None]
+            n_replaced_spatial_median += int(np.sum(finite_x) * edge_spatial_rows.size)
+
+        # Pass 2: set x-edge columns from per-y means across interior dispersion.
+        y_means = np.nanmean(frame[x_in_lo:x_in_hi, :], axis=0)
+        finite_y = np.isfinite(y_means)
+        if np.any(finite_y):
+            frame[x_lo, finite_y] = y_means[finite_y]
+            frame[x_hi, finite_y] = y_means[finite_y]
+            n_replaced_dispersion_mean += int(2 * np.sum(finite_y))
+
+        corrected[f] = frame
+
+    info = {
+        "spatial_low": s_lo,
+        "spatial_high": s_hi,
+        "dispersion_low": x_lo,
+        "dispersion_high": x_hi,
+        "n_spatial_edge_rows": ner,
+        "n_replaced_spatial_median": int(n_replaced_spatial_median),
+        "n_replaced_dispersion_mean": int(n_replaced_dispersion_mean),
+        "n_replaced_total": int(n_replaced_spatial_median + n_replaced_dispersion_mean),
+    }
+    return corrected, info
 
 
 @njit(parallel=True, fastmath=True)
@@ -1727,6 +1889,7 @@ def plot_difference_image_photometry_comparison(
     integration_keep_mask=None,
     label_base="Aperture photometry",
     label_diff="Difference-image photometry",
+    flux_ylim=(0.97, 1.03),
 ):
     """Compare standard and difference-image white-light photometry."""
     t = np.asarray(integration_time_axis, dtype=float)
@@ -1761,6 +1924,8 @@ def plot_difference_image_photometry_comparison(
     ax.axhline(1.0, color="k", lw=1, ls=":")
     ax.set_ylabel("Normalized white-light flux")
     ax.set_title("Difference-Image vs Standard White-Light Photometry")
+    if flux_ylim is not None:
+        ax.set_ylim(float(flux_ylim[0]), float(flux_ylim[1]))
     ax.legend(loc="best", fontsize=8)
 
     ax = axes[1]
@@ -1979,3 +2144,365 @@ def plot_multimetric_correlation_and_pca(
         ax.set_axis_off()
 
     plt.show()
+    
+def compute_ramp_fit_products_r2s(ramp_cube, sigcut=2.0):
+	"""Compute robust ramp-fit products per integration using JWST-style r2s fitting.
+
+	Returns slope, intercept, and fit scatter images with shape
+	(integration, row, column).
+	"""
+	try:
+		import jwst_soss_reduction as soss_red
+	except Exception as exc:
+		raise ImportError(
+			"jwst_soss_reduction.py is required for r2s-style ramp fitting."
+		) from exc
+
+	ramp = np.asarray(ramp_cube, dtype=float)
+	if ramp.ndim != 4:
+		raise ValueError(f"ramp_cube must be 4D, got shape {ramp.shape}.")
+
+	nint, ngroup, ny, nx = ramp.shape
+	dq = np.zeros((ny, nx), dtype=np.int32)
+	nrsatmap = np.full((ny, nx), ngroup, dtype=np.int32)
+
+	intercept_cube = np.zeros((nint, ny, nx), dtype=float)
+	slope_cube = np.zeros((nint, ny, nx), dtype=float)
+	scatter_cube = np.zeros((nint, ny, nx), dtype=float)
+	bpix_cube = np.zeros((nint, ny, nx), dtype=np.int16)
+
+	for i in range(nint):
+		zpt, stdimage, slope, bpixmap = soss_red.r2s_test(
+			ramp[i],
+			dq,
+			nrsatmap,
+			sigcut=float(sigcut),
+		)
+		intercept_cube[i] = np.asarray(zpt, dtype=float)
+		slope_cube[i] = np.asarray(slope, dtype=float)
+		scatter_cube[i] = np.asarray(stdimage, dtype=float)
+		bpix_cube[i] = np.asarray(bpixmap, dtype=np.int16)
+
+	info = {
+		"sigcut": float(sigcut),
+		"n_integrations": int(nint),
+		"n_groups": int(ngroup),
+	}
+
+	return {
+		"intercept": intercept_cube,
+		"slope": slope_cube,
+		"scatter": scatter_cube,
+		"bpix": bpix_cube,
+		"info": info,
+	}
+ 
+def detect_hot_pixels_from_ramp_fit(
+	intercept_cube,
+	scatter_cube=None,
+	intercept_sigma=8.0,
+	min_intercept_offset_dn=150.0,
+	scatter_sigma=8.0,
+):
+	"""Build persistent hot/unstable pixel mask from ramp-fit diagnostics."""
+	intercept = np.asarray(intercept_cube, dtype=float)
+	if intercept.ndim != 3:
+		raise ValueError(
+			f"intercept_cube must be 3D (integration,row,column), got {intercept.shape}."
+		)
+
+	pixel_intercept = np.nanmedian(intercept, axis=0)
+	global_med = float(np.nanmedian(pixel_intercept))
+	global_mad = float(np.nanmedian(np.abs(pixel_intercept - global_med)))
+	global_sig = 1.4826 * global_mad
+
+	ithr = max(global_med + intercept_sigma * global_sig, global_med + min_intercept_offset_dn)
+	hot_mask = pixel_intercept > ithr
+
+	if scatter_cube is not None:
+		scatter = np.asarray(scatter_cube, dtype=float)
+		if scatter.shape != intercept.shape:
+			raise ValueError(
+				f"scatter_cube shape {scatter.shape} must match intercept_cube {intercept.shape}."
+			)
+		pixel_scatter = np.nanmedian(scatter, axis=0)
+		s_med = float(np.nanmedian(pixel_scatter))
+		s_mad = float(np.nanmedian(np.abs(pixel_scatter - s_med)))
+		s_sig = 1.4826 * s_mad
+		s_thr = s_med + scatter_sigma * s_sig
+		hot_mask |= pixel_scatter > s_thr
+	else:
+		s_thr = np.nan
+
+	hot_mask |= ~np.isfinite(pixel_intercept)
+
+	info = {
+		"intercept_threshold_dn": float(ithr),
+		"scatter_threshold": float(s_thr) if np.isfinite(s_thr) else None,
+		"hot_fraction": float(np.mean(hot_mask)),
+		"n_hot": int(np.sum(hot_mask)),
+	}
+	return hot_mask, info
+
+def display_correction_comparison(
+	raw_cube,
+	corrected_cube,
+	image_index=0,
+	scale_style="zscale",
+	iraf_contrast=0.25,
+	cmap="viridis",
+	diff_cmap="RdBu_r",
+	rotate_k=1,
+	xlabel=None,
+	ylabel=None,
+):
+	"""Show raw, corrected, and residual images with consistent display scaling."""
+	raw = np.asarray(raw_cube)
+	corr = np.asarray(corrected_cube)
+	if raw.ndim != 3 or corr.ndim != 3:
+		raise ValueError("raw_cube and corrected_cube must both be 3D arrays.")
+	if raw.shape != corr.shape:
+		raise ValueError(f"Cube shape mismatch: {raw.shape} vs {corr.shape}.")
+	if not 0 <= image_index < raw.shape[0]:
+		raise IndexError(
+			f"image_index={image_index} is out of bounds for {raw.shape[0]} frames."
+		)
+
+	raw_frame = raw[image_index]
+	corr_frame = corr[image_index]
+	resid = corr_frame - raw_frame
+
+	raw_frame_plot = np.rot90(raw_frame, k=rotate_k)
+	corr_frame_plot = np.rot90(corr_frame, k=rotate_k)
+	resid_plot = np.rot90(resid, k=rotate_k)
+
+	if xlabel is None or ylabel is None:
+		# Original image uses (row, column) = (dispersion, spatial).
+		# After odd 90-degree rotations, displayed x/y swap.
+		if rotate_k % 2 != 0:
+			xlabel_auto = "Dispersion pixel"
+			ylabel_auto = "Spatial pixel"
+		else:
+			xlabel_auto = "Spatial pixel"
+			ylabel_auto = "Dispersion pixel"
+		xlabel = xlabel if xlabel is not None else xlabel_auto
+		ylabel = ylabel if ylabel is not None else ylabel_auto
+
+	combined = np.concatenate([raw_frame.ravel(), corr_frame.ravel()])
+	combined = combined[np.isfinite(combined)]
+	if combined.size == 0:
+		raise ValueError("No finite values found for comparison display.")
+
+	style = str(scale_style).lower()
+	if style == "zscale":
+		vmin, vmax = ZScaleInterval(contrast=iraf_contrast).get_limits(combined)
+	else:
+		vmin, vmax = float(np.nanpercentile(combined, 1)), float(np.nanpercentile(combined, 99))
+
+	resid_abs = np.nanpercentile(np.abs(resid[np.isfinite(resid)]), 99)
+	if not np.isfinite(resid_abs) or resid_abs == 0:
+		resid_abs = 1.0
+
+	fig, axes = plt.subplots(
+		3,
+		1,
+		figsize=(10, 10),
+		gridspec_kw={"hspace": 0.08},
+		constrained_layout=True,
+	)
+
+	im0 = axes[0].imshow(
+		raw_frame_plot,
+		origin="lower",
+		cmap=cmap,
+		vmin=vmin,
+		vmax=vmax,
+		aspect="auto",
+	)
+	axes[0].set_title("Raw")
+	axes[0].set_xlabel(xlabel)
+	axes[0].set_ylabel(ylabel)
+	fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+	im1 = axes[1].imshow(
+		corr_frame_plot,
+		origin="lower",
+		cmap=cmap,
+		vmin=vmin,
+		vmax=vmax,
+		aspect="auto",
+	)
+	axes[1].set_title("Corrected")
+	axes[1].set_xlabel(xlabel)
+	axes[1].set_ylabel(ylabel)
+	fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+	im2 = axes[2].imshow(
+		resid_plot,
+		origin="lower",
+		cmap=diff_cmap,
+		vmin=-resid_abs,
+		vmax=resid_abs,
+		aspect="auto",
+	)
+	axes[2].set_title("Residual (Corrected - Raw)")
+	axes[2].set_xlabel(xlabel)
+	axes[2].set_ylabel(ylabel)
+	fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+	plt.show()
+
+
+def animate_datacube(
+	cube,
+	title="Datacube Animation",
+	frame_labels=None,
+	cmap="viridis",
+	scale_style="zscale",
+	iraf_contrast=0.25,
+	vmin=None,
+	vmax=None,
+	interval=100,
+	repeat=True,
+	xlabel="Dispersion pixel",
+	ylabel="Spatial pixel",
+	output_path=None,
+	fps=10,
+	dpi=100,
+	embed_limit_mb=2048,
+):
+	"""Animate a 3-D datacube (n_frames, n_x, n_y) frame by frame.
+
+	Parameters
+	----------
+	cube : ndarray, shape (n_frames, n_x, n_y)
+		Datacube to animate.  The first axis is the frame axis.
+	title : str
+		Figure / window title.
+	frame_labels : sequence of str, optional
+		Per-frame label shown in the top-left corner (e.g. JD strings).
+		If None the frame index is shown instead.
+	cmap : str
+		Matplotlib colormap name.
+	scale_style : str
+		One of ``"zscale"``, ``"percentile"``, or ``"minmax"``.
+		Used to derive ``vmin``/``vmax`` when they are not supplied.
+		*zscale* uses ``astropy.visualization.ZScaleInterval`` on the
+		median frame.
+	iraf_contrast : float
+		Contrast parameter forwarded to ``ZScaleInterval`` (only used
+		when ``scale_style="zscale"``).
+	vmin, vmax : float, optional
+		Override the automatic colour scale limits.
+	interval : int
+		Delay between frames in milliseconds (for display).
+	repeat : bool
+		Whether the animation loops.
+	xlabel, ylabel : str
+		Axis labels.
+	output_path : str or None
+		If provided, save the animation to this path (e.g.
+		``"animation.mp4"`` or ``"animation.gif"``) instead of
+		displaying it interactively.  Requires *ffmpeg* (mp4/avi) or
+		*pillow* (gif) to be installed.
+	fps : int
+		Frames per second used when saving to a file.
+	dpi : int
+		DPI used when saving to a file.
+	embed_limit_mb : float
+		Maximum size in MB for an embedded (jshtml) animation.  Raises
+		``matplotlib.rcParams['animation.embed_limit']`` to this value so
+		all frames are included.  Default 2048 MB (2 GB).
+
+	Returns
+	-------
+	anim : matplotlib.animation.FuncAnimation
+		The animation object (useful for embedding in notebooks via
+		``IPython.display.HTML(anim.to_jshtml())``).
+	"""
+	import matplotlib
+	from matplotlib.animation import FuncAnimation
+
+	# jshtml base64-encodes every frame, so actual embed size is hard to
+	# predict from a single-frame PNG measurement.  Just raise the cap to
+	# the caller-supplied ceiling (default 2 GB) and let matplotlib use
+	# whatever it needs.
+	matplotlib.rcParams['animation.embed_limit'] = embed_limit_mb
+
+	cube = np.asarray(cube)
+	if cube.ndim != 3:
+		raise ValueError(f"animate_datacube expects a 3-D array; got shape {cube.shape}")
+
+	n_frames = cube.shape[0]
+
+	# --- Derive colour scale from median frame when not overridden --------
+	if vmin is None or vmax is None:
+		median_frame = np.nanmedian(cube, axis=0)
+		finite_vals = median_frame[np.isfinite(median_frame)]
+		if finite_vals.size == 0:
+			finite_vals = np.array([0.0, 1.0])
+
+		if scale_style == "zscale":
+			interval_obj = ZScaleInterval(contrast=iraf_contrast)
+			z1, z2 = interval_obj.get_limits(finite_vals.reshape(-1, 1))
+		elif scale_style == "percentile":
+			z1, z2 = np.nanpercentile(finite_vals, [1, 99])
+		else:  # minmax
+			z1, z2 = float(np.nanmin(finite_vals)), float(np.nanmax(finite_vals))
+
+		if vmin is None:
+			vmin = z1
+		if vmax is None:
+			vmax = z2
+
+	# --- Build figure -------------------------------------------------------
+	fig, ax = plt.subplots(figsize=(8, 5))
+	fig.suptitle(title)
+
+	frame0_plot = np.rot90(cube[0])
+	im = ax.imshow(
+		frame0_plot,
+		origin="lower",
+		cmap=cmap,
+		vmin=vmin,
+		vmax=vmax,
+		aspect="auto",
+		animated=True,
+	)
+	ax.set_xlabel(xlabel)
+	ax.set_ylabel(ylabel)
+	fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+	label_text = ax.text(
+		0.02, 0.97,
+		frame_labels[0] if frame_labels is not None else f"Frame 0",
+		transform=ax.transAxes,
+		fontsize=9,
+		va="top",
+		color="white",
+		bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.5),
+	)
+
+	def _update(i):
+		im.set_data(np.rot90(cube[i]))
+		lbl = frame_labels[i] if frame_labels is not None else f"Frame {i}"
+		label_text.set_text(lbl)
+		return im, label_text
+
+	anim = FuncAnimation(
+		fig,
+		_update,
+		frames=n_frames,
+		interval=interval,
+		blit=True,
+		repeat=repeat,
+	)
+
+	if output_path is not None:
+		anim.save(output_path, fps=fps, dpi=dpi)
+		plt.close(fig)
+	else:
+		plt.tight_layout()
+		plt.show()
+
+	return anim

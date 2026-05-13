@@ -45,6 +45,14 @@ badpix_params = {
 	"edge_dispersion_high": 399,
 }
 
+cr_params = {
+	"window_frames": 9,
+	"sigma": 4.5,
+	"min_neighbors": 3,
+	"positive_only": True,
+	"plot_counts_vs_integration": True,
+}
+
 # Tunable trace/aperture priors.
 trace_params = {
 	"dispersion_min": 73,
@@ -207,16 +215,41 @@ print(
 	f"(spatial-edge median={edge_info['n_replaced_spatial_median']}, dispersion-edge mean={edge_info['n_replaced_dispersion_mean']})"
 )
 # %%
-pandora.display_correction_comparison(
-	fit_products_pre["slope"],
+slope_cube_cr_corrected, cr_mask, cr_info = pandora.correct_cosmic_rays_temporally(
 	slope_cube_repaired,
+	window_frames=cr_params["window_frames"],
+	sigma=cr_params["sigma"],
+	min_neighbors=cr_params["min_neighbors"],
+	positive_only=cr_params["positive_only"],
+)
+
+print(
+	f"Cosmic-ray correction applied: replaced {cr_info['n_replaced']} samples "
+	f"({100.0 * cr_info['replacement_fraction']:.4f}% of the cube)"
+)
+
+if cr_params["plot_counts_vs_integration"]:
+	cr_stats = pandora.plot_cosmic_ray_counts_by_integration(cr_mask)
+	print(
+		"CR counts per integration: "
+		f"median={cr_stats['median']:.1f}, p95={cr_stats['p95']:.1f}, "
+		f"max={cr_stats['max']} at integration {cr_stats['argmax']}"
+	)
+# %%
+
+
+
+# %%
+pandora.display_correction_comparison(
+	slope_cube_repaired,
+	slope_cube_cr_corrected,
 	image_index=45,
 	scale_style="zscale",
     iraf_contrast=0.1
 )
 # %%
 trace_est = pandora.estimate_trace_aperture(
-	slope_cube_repaired,
+	slope_cube_cr_corrected,
 	dispersion_min=trace_params["dispersion_min"],
 	dispersion_max=trace_params["dispersion_max"],
 	expected_spatial_center=trace_params["expected_spatial_center"],
@@ -233,7 +266,7 @@ aperture_model = pandora.build_linear_trace_aperture(
 	spatial_left_end=trace_params["spatial_left_end"],
 	spatial_right_start=trace_params["spatial_right_start"],
 	spatial_right_end=trace_params["spatial_right_end"],
-	n_spatial=slope_cube_repaired.shape[2],
+	n_spatial=slope_cube_cr_corrected.shape[2],
 )
 
 print(
@@ -245,13 +278,13 @@ print(f"Detected peak positions: {trace_est['peak_positions']}")
 print(f"Photometric aperture pixels: {int(np.sum(aperture_model['aperture_mask']))}")
 
 pandora.plot_spatial_profile(trace_est, trace_params)
-pandora.plot_aperture_overlay(slope_cube_repaired, aperture_model, trace_est)
+pandora.plot_aperture_overlay(slope_cube_cr_corrected, aperture_model, trace_est)
 # %%
 # Perform spectrophotometric extraction.
 photometry_bad_mask = repair_mask
 
 extracted_spectra, extracted_dispersion, extraction_info = pandora.extract_trace_spectra_variable_aperture(
-    slope_cube_repaired,
+	slope_cube_cr_corrected,
     aperture_model=aperture_model,
 	bad_pixel_mask=photometry_bad_mask,
     subtract_background=extract_params["subtract_local_background"],
@@ -292,7 +325,7 @@ spectral_scatter_ppm = wl["spectral_scatter_ppm"]
 median_background_per_pixel = wl["median_background_per_pixel"]
 
 centroid_info = pandora.compute_aperture_motion_centroids(
-    slope_cube_repaired, aperture_model,
+	slope_cube_cr_corrected, aperture_model,
     background_per_pixel=extraction_info["background_per_pixel"],
     bad_pixel_mask=photometry_bad_mask,
     guard_pixels=int(extract_params["motion_aperture_guard_pixels"]),
@@ -328,8 +361,8 @@ pandora.plot_spectrophotometry_diagnostics(
 pandora.plot_flux_motion_correlation(dx, dy, white_light_norm, integration_time_axis, time_axis_label)
 # %%
 anim = pandora.animate_datacube(
-    slope_cube_repaired,
-    title="slope_cube_repaired",
+	slope_cube_cr_corrected,
+	title="slope_cube_cr_corrected",
     scale_style="zscale",
     iraf_contrast=0.25,
     interval=80,          # ms per frame
@@ -339,10 +372,227 @@ from IPython.display import HTML
 HTML(anim.to_jshtml())
 # %%
 pandora.animate_datacube(
-    slope_cube_repaired,
-    title="slope_cube_repaired",
-    output_path="slope_cube_repaired.mp4",
+	slope_cube_cr_corrected,
+	title="slope_cube_cr_corrected",
+	output_path="slope_cube_cr_corrected.mp4",
     fps=15,
     dpi=100,
+)
+# %%
+# Difference-imaging motion settings.
+diff_motion_params = {
+	# Central-difference kernels for image gradients in x (columns) and y (rows).
+	"kernel_dx": (-0.5, 0.0, 0.5),
+	"kernel_dy": (-0.5, 0.0, 0.5),
+	# Fit a variable background plane with offset + x + y terms.
+	"background_order": 1,
+	# Robust clip in units of MAD-sigma on the difference image residuals.
+	"clip_sigma": 8.0,
+	# Minimum valid pixels per frame required for a stable shift fit.
+	"min_valid_pixels": 2500,
+}
+# %%
+if np.any(oot_mask):
+	rough_reference = np.nanmedian(slope_cube_cr_corrected[oot_mask], axis=0)
+else:
+	rough_reference = np.nanmedian(slope_cube_cr_corrected, axis=0)
+
+diff_shift_init = pandora.estimate_difference_image_shifts(
+	slope_cube_cr_corrected,
+	reference_image=rough_reference,
+	bad_pixel_mask=photometry_bad_mask,
+	kernel_dx=diff_motion_params["kernel_dx"],
+	kernel_dy=diff_motion_params["kernel_dy"],
+	background_order=diff_motion_params["background_order"],
+	clip_sigma=diff_motion_params["clip_sigma"],
+	min_valid_pixels=diff_motion_params["min_valid_pixels"],
+)
+
+# Build aligned master frame from shifted OOT integrations.
+diff_reference = pandora.build_aligned_master_frame(
+	slope_cube_cr_corrected,
+	diff_shift_init["dx"],
+	diff_shift_init["dy"],
+	use_mask=oot_mask,
+)
+
+# Pass 2: refined shifts against aligned master frame.
+diff_shift = pandora.estimate_difference_image_shifts(
+	slope_cube_cr_corrected,
+	reference_image=diff_reference,
+	bad_pixel_mask=photometry_bad_mask,
+	kernel_dx=diff_motion_params["kernel_dx"],
+	kernel_dy=diff_motion_params["kernel_dy"],
+	background_order=diff_motion_params["background_order"],
+	clip_sigma=diff_motion_params["clip_sigma"],
+	min_valid_pixels=diff_motion_params["min_valid_pixels"],
+)
+
+dx_diff = diff_shift["dx"]
+dy_diff = diff_shift["dy"]
+dx_diff -= np.nanmedian(dx_diff[oot_mask])
+dy_diff -= np.nanmedian(dy_diff[oot_mask])
+
+valid_motion = np.isfinite(dx_diff) & np.isfinite(dy_diff)
+valid_vs_centroid = valid_motion & np.isfinite(dx) & np.isfinite(dy)
+
+print(
+	"Difference-imaging fit quality: "
+	f"median valid pixels/frame={np.nanmedian(diff_shift['n_valid_pixels']):.0f}, "
+	f"median residual RMS={np.nanmedian(diff_shift['residual_rms']):.6g}"
+)
+print(
+	"Difference-imaging drift RMS: "
+	f"dx={np.nanstd(dx_diff[valid_motion]):.4f} pix, "
+	f"dy={np.nanstd(dy_diff[valid_motion]):.4f} pix"
+)
+if np.any(valid_vs_centroid):
+	corr_dx = np.corrcoef(dx_diff[valid_vs_centroid], dx[valid_vs_centroid])[0, 1]
+	corr_dy = np.corrcoef(dy_diff[valid_vs_centroid], dy[valid_vs_centroid])[0, 1]
+	print(f"Correlation with aperture-centroid motion: corr(dx)={corr_dx:.3f}, corr(dy)={corr_dy:.3f}")
+
+pandora.plot_difference_imaging_motion(
+	integration_time_axis,
+	dx_diff,
+	dy_diff,
+	oot_mask=oot_mask,
+	dx_reference=dx,
+	dy_reference=dy,
+)
+pandora.plot_white_light_vs_dx_log(
+	dx_diff,
+	white_light_norm,
+	oot_mask=oot_mask,
+	integration_keep_mask=integration_keep_mask,
+	dx_label="dx_diff",
+)
+# %%
+# Difference-imaging photometry settings.
+diff_phot_params = {
+	"subtract_background": True,
+	"background_inner_gap": 2,
+	"background_width": 10,
+	"use_aperture_weights": True,
+	"weight_sigma_scale": 4.0,
+}
+# %%
+
+# Multimetric diagnostics settings (correlation + PCA + telemetry).
+diagnostic_params = {
+	"telemetry_hdu_names": ("VITL_DATA", "SC_QUATERNIONS", "SC_POSITION", "SC_VELOCITY"),
+	"n_pca_components": 5,
+	"max_plot_labels": 24,
+}
+
+# %%
+# Difference-imaging photometry (aperture sum on reference + per-frame difference flux).
+diff_spectra_total, diff_dispersion, diff_phot_info = pandora.extract_difference_image_photometry(
+	slope_cube_cr_corrected,
+	aperture_model,
+	reference_image=diff_reference,
+	shift_x=dx_diff,
+	shift_y=dy_diff,
+	bad_pixel_mask=photometry_bad_mask,
+	subtract_background=diff_phot_params["subtract_background"],
+	background_inner_gap=diff_phot_params["background_inner_gap"],
+	background_width=diff_phot_params["background_width"],
+	background_mask=photometry_bad_mask,
+	use_aperture_weights=diff_phot_params["use_aperture_weights"],
+	weight_sigma_scale=diff_phot_params["weight_sigma_scale"],
+	return_diagnostics=True,
+)
+
+diff_spectra_masked = diff_spectra_total.copy()
+diff_spectra_masked[:, ~channel_good] = np.nan
+
+white_light_diff = np.nansum(diff_spectra_masked, axis=1)
+white_light_diff_norm = white_light_diff / np.nanmedian(white_light_diff[oot_mask])
+
+print(
+	"Difference-image white-light stats: "
+	f"median={np.nanmedian(white_light_diff):.6g}, std={np.nanstd(white_light_diff):.6g}"
+)
+print(
+	"Difference-image normalized scatter (OOT): "
+	f"{1e6*np.nanstd(white_light_diff_norm[oot_mask] - np.nanmedian(white_light_diff_norm[oot_mask])):.1f} ppm"
+)
+
+pandora.plot_difference_image_photometry_comparison(
+	integration_time_axis,
+	white_light_norm,
+	white_light_diff_norm,
+	oot_mask=oot_mask,
+	integration_keep_mask=integration_keep_mask,
+)
+# %%
+plt.scatter(integration_time_axis, white_light_norm, color="red", label="Raw background-subtracted", s=5)
+plt.scatter(integration_time_axis, white_light_clean, color="tab:green", label="Kept integrations", s=5)
+plt.axhline(1.0, color="k", ls=":", lw=1)
+plt.xlabel(time_axis_label)
+plt.ylabel("Normalized white-light flux")
+plt.ylim(0.97, 1.03)
+plt.legend(loc="best", fontsize=8)
+plt.show()
+# %%
+# Explore scatter drivers: photometry vs motion, fit residuals, and spacecraft telemetry.
+integration_jd = np.asarray(time_jd_cube[:, -1], dtype=float)
+
+telemetry_channels = pandora.list_fits_telemetry_channels(fits_path)
+print("Available table telemetry channels by HDU:")
+for hname, cols in telemetry_channels.items():
+	print(f"  {hname}: {cols[:8]}{' ...' if len(cols) > 8 else ''}")
+
+science_header_numeric = pandora.extract_numeric_header_cards(science_header)
+print(f"Numeric RAW SCIENCE header cards: {len(science_header_numeric)}")
+
+telemetry_series = pandora.sample_fits_telemetry_to_integrations(
+	fits_path,
+	integration_jd,
+	hdu_names=diagnostic_params["telemetry_hdu_names"],
+)
+print(f"Sampled telemetry channels onto integration grid: {len(telemetry_series)}")
+
+background_per_integration = np.nanmedian(extraction_info["background_per_pixel"], axis=1)
+metric_series = {
+	"white_light_norm": white_light_norm,
+	"white_light_clean": white_light_clean,
+	"white_light_raw": wl["white_light"],
+	"white_light_diff_raw": white_light_diff,
+	"white_light_diff_norm": white_light_diff_norm,
+	"white_light_delta_norm": white_light_diff_norm - white_light_norm,
+	"dx_aperture": dx,
+	"dy_aperture": dy,
+	"r_aperture": np.sqrt(dx * dx + dy * dy),
+	"dx_diff": dx_diff,
+	"dy_diff": dy_diff,
+	"r_diff": np.sqrt(dx_diff * dx_diff + dy_diff * dy_diff),
+	"diff_bg_offset": diff_shift["background_offset"],
+	"diff_bg_x": diff_shift["background_x"],
+	"diff_bg_y": diff_shift["background_y"],
+	"diff_resid_rms": diff_shift["residual_rms"],
+	"diff_valid_px": diff_shift["n_valid_pixels"].astype(float),
+	"bkg_per_integration": background_per_integration,
+	"keep_mask": integration_keep_mask.astype(float),
+}
+metric_series.update(telemetry_series)
+
+metric_diag = pandora.compute_multimetric_correlation_and_pca(
+	metric_series,
+	white_key="white_light_norm",
+	oot_mask=oot_mask,
+	n_components=diagnostic_params["n_pca_components"],
+)
+
+print("Top |corr| with white_light_norm:")
+keys = metric_diag["keys"]
+corr_to_wl = metric_diag["corr_to_white"]
+order = np.argsort(np.abs(corr_to_wl))[::-1]
+for idx in order[:12]:
+	print(f"  {keys[idx]:>24s}: {corr_to_wl[idx]: .4f}")
+
+pandora.plot_multimetric_correlation_and_pca(
+	metric_diag,
+	white_light_norm=white_light_norm,
+	max_labels=diagnostic_params["max_plot_labels"],
 )
 # %%

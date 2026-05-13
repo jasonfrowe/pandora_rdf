@@ -503,6 +503,139 @@ def correct_detector_edge_pixels(
     return corrected, info
 
 
+def correct_cosmic_rays_temporally(
+    cube,
+    window_frames=9,
+    sigma=6.0,
+    min_neighbors=3,
+    positive_only=True,
+    replace_nonfinite=True,
+):
+    """Suppress transient cosmic-ray hits with a temporal median/MAD filter.
+
+    Each pixel is compared against a centered window of neighboring frames.
+    Positive outliers above the robust local threshold are replaced with the
+    local temporal median.
+    """
+    arr = np.asarray(cube, dtype=float)
+    if arr.ndim != 3:
+        raise ValueError(f"cube must be 3D, got shape {arr.shape}.")
+
+    n_frames = arr.shape[0]
+    width = max(3, int(window_frames))
+    if width % 2 == 0:
+        width += 1
+    half_width = width // 2
+    min_neighbors = max(1, int(min_neighbors))
+    threshold_sigma = float(sigma)
+
+    corrected = arr.copy()
+    replaced_mask = np.zeros_like(corrected, dtype=bool)
+    replaced_per_integration = np.zeros(n_frames, dtype=np.int64)
+    n_replaced = 0
+
+    for frame_idx in range(n_frames):
+        lo = max(0, frame_idx - half_width)
+        hi = min(n_frames, frame_idx + half_width + 1)
+        window = arr[lo:hi]
+
+        if window.shape[0] > 1:
+            local_idx = frame_idx - lo
+            neighbors = np.concatenate((window[:local_idx], window[local_idx + 1 :]), axis=0)
+        else:
+            neighbors = window
+
+        if neighbors.shape[0] < min_neighbors:
+            neighbors = window
+        if neighbors.shape[0] < min_neighbors:
+            continue
+
+        local_median = np.nanmedian(neighbors, axis=0)
+        abs_dev = np.abs(neighbors - local_median[None, :, :])
+        local_mad = np.nanmedian(abs_dev, axis=0)
+        local_sigma = 1.4826 * local_mad
+        fallback_sigma = np.nanstd(neighbors, axis=0)
+        local_sigma = np.where(
+            np.isfinite(local_sigma) & (local_sigma > 0),
+            local_sigma,
+            fallback_sigma,
+        )
+        local_sigma = np.where(
+            np.isfinite(local_sigma) & (local_sigma > 0),
+            local_sigma,
+            1.0,
+        )
+
+        current = corrected[frame_idx]
+        finite = np.isfinite(current)
+        delta = current - local_median
+        if positive_only:
+            cosmic_ray_mask = finite & (delta > threshold_sigma * local_sigma)
+        else:
+            cosmic_ray_mask = finite & (np.abs(delta) > threshold_sigma * local_sigma)
+
+        if replace_nonfinite:
+            cosmic_ray_mask |= (~finite) & np.isfinite(local_median)
+
+        if np.any(cosmic_ray_mask):
+            current = current.copy()
+            current[cosmic_ray_mask] = local_median[cosmic_ray_mask]
+            corrected[frame_idx] = current
+            replaced_mask[frame_idx] = cosmic_ray_mask
+            n_frame = int(np.sum(cosmic_ray_mask))
+            replaced_per_integration[frame_idx] = n_frame
+            n_replaced += n_frame
+
+    info = {
+        "window_frames": int(width),
+        "sigma": float(threshold_sigma),
+        "min_neighbors": int(min_neighbors),
+        "positive_only": bool(positive_only),
+        "n_replaced": int(n_replaced),
+        "replacement_fraction": float(n_replaced / corrected.size),
+        "replaced_per_integration": replaced_per_integration,
+    }
+    return corrected, replaced_mask, info
+
+
+def plot_cosmic_ray_counts_by_integration(cr_mask, integration_axis=None, time_axis_label="Integration index"):
+    """Plot detected cosmic-ray replacements per integration."""
+    mask = np.asarray(cr_mask, dtype=bool)
+    if mask.ndim != 3:
+        raise ValueError(f"cr_mask must be 3D, got shape {mask.shape}.")
+
+    counts = np.sum(mask, axis=(1, 2)).astype(int)
+    nint = counts.size
+
+    if integration_axis is None:
+        x = np.arange(nint, dtype=float)
+        xlabel = "Integration index"
+    else:
+        x = np.asarray(integration_axis, dtype=float)
+        if x.shape != (nint,):
+            raise ValueError(
+                f"integration_axis shape {x.shape} must match ({nint},)."
+            )
+        xlabel = str(time_axis_label)
+
+    fig, ax = plt.subplots(figsize=(10, 3.5))
+    ax.plot(x, counts, color="tab:red", lw=1.0, marker=".", ms=3)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Detected CR pixels")
+    ax.set_title("Cosmic-Ray Detections per Integration")
+    ax.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        "counts": counts,
+        "median": float(np.nanmedian(counts)),
+        "p95": float(np.nanpercentile(counts, 95.0)),
+        "max": int(np.nanmax(counts)),
+        "argmax": int(np.nanargmax(counts)),
+    }
+
+
 @njit(parallel=True, fastmath=True)
 def _get_slope_cube_owls_numba(ramp_cube, times, read_noise=10.0, gain=1.0, threshold=4.0):
 	"""

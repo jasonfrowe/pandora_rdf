@@ -83,6 +83,33 @@ extract_params = {
     "motion_sigma": 6.0,
 }
 
+# Gap detection / reacquisition masking parameters.
+gap_params = {
+	# Time jump in seconds that marks a visibility gap.
+	"gap_threshold_s": 100.0,
+	# Number of integrations to discard after target reacquisition.
+	"reacq_frames": 6,
+	# Always exclude the very first N integrations of the observation.
+	"initial_frames": 6,
+	# Additional manually identified bad integration indices (0-based).
+	"manual_bad_indices": [],
+}
+
+# PCA telemetry decorrelation parameters.
+pca_params = {
+	"telemetry_hdu_names": ("VITL_DATA", "SC_QUATERNIONS", "SC_POSITION", "SC_VELOCITY"),
+	"n_components": 3,
+	# Polynomial order in time used alongside PCA + motion + background regressors.
+	"time_poly_order": 2,
+}
+
+# Transit/event ephemeris.
+ephem_params = {
+	"period_days": 3.3448285,
+	"t0_hjd_utc": 2456927.06839,
+	"t14_hours": 3.470,
+}
+
 # %%
 ramp_cube, science_header = pandora.read_rdf_raw_science(fits_path)
 cube = pandora.flatten_ramp_cube(ramp_cube)
@@ -101,6 +128,7 @@ if exposure_time_s is not None:
 	)
 
 time_jd_cube = pandora.read_rdf_time_extension(fits_path)
+integration_jd = np.asarray(time_jd_cube[:, -1], dtype=float)
 print(
 	f"Loaded TIME extension: {time_jd_cube.shape}, "
 	f"jd range=({np.nanmin(time_jd_cube):.6f}, {np.nanmax(time_jd_cube):.6f})"
@@ -341,6 +369,26 @@ integration_keep_mask = pandora.reject_photometric_excursions(
     excursion_padding=extract_params["excursion_padding"],
     motion_sigma=extract_params["motion_sigma"],
 )
+
+# --- Gap / reacquisition masking ---
+# Discard the first N integrations at the very start of the observation.
+integration_keep_mask[:gap_params["initial_frames"]] = False
+
+# Find time jumps that indicate an Earth-occultation or SAA gap.
+_dt_s = np.diff(integration_jd) * 86400.0
+_gap_starts = np.where(_dt_s > gap_params["gap_threshold_s"])[0]
+print(f"Observation gaps detected at integration indices: {_gap_starts.tolist()}")
+for _g in _gap_starts:
+	_lo = int(_g) + 1
+	_hi = min(nint, int(_g) + 1 + gap_params["reacq_frames"])
+	integration_keep_mask[_lo:_hi] = False
+
+if gap_params["manual_bad_indices"]:
+	for _idx in gap_params["manual_bad_indices"]:
+		if 0 <= int(_idx) < nint:
+			integration_keep_mask[int(_idx)] = False
+	print(f"Manual bad integrations excluded: {gap_params['manual_bad_indices']}")
+
 white_light_clean = white_light_norm.copy()
 white_light_clean[~integration_keep_mask] = np.nan
 
@@ -352,8 +400,6 @@ print(f"Extracted spectra shape: {extracted_spectra_masked.shape}  (integration 
 print(f"White-light stats: median={np.nanmedian(wl['white_light']):.6g}, std={np.nanstd(wl['white_light']):.6g}")
 print(f"Pointing drift: dx rms={np.nanstd(dx):.4f} pix, dy rms={np.nanstd(dy):.4f} pix")
 
-integration_jd = np.asarray(time_jd_cube[:, -1], dtype=float)
-
 pandora.plot_spectrophotometry_diagnostics(
     extracted_dispersion, median_spectrum, channel_good,
     integration_time_axis, white_light_norm, white_light_clean,
@@ -361,6 +407,88 @@ pandora.plot_spectrophotometry_diagnostics(
     dx, oot_mask, spectral_scatter_ppm, time_axis_label,
 )
 pandora.plot_flux_motion_correlation(dx, dy, white_light_norm, integration_time_axis, time_axis_label)
+# %%
+# --- PCA telemetry decorrelation ---
+# Compute predicted event window from ephemeris (used in the plot below).
+_epoch = int(np.rint((np.nanmedian(integration_jd) - ephem_params["t0_hjd_utc"]) / ephem_params["period_days"]))
+event_center_jd   = ephem_params["t0_hjd_utc"] + _epoch * ephem_params["period_days"]
+event_ingress_jd  = event_center_jd - 0.5 * ephem_params["t14_hours"] / 24.0
+event_egress_jd   = event_center_jd + 0.5 * ephem_params["t14_hours"] / 24.0
+
+# Build a telemetry matrix from the four spacecraft HDUs, standardise, and
+# compute PCA components via SVD.  A linear systematic model is then fit
+# OOT-only and removed from the full time series.
+_tel_series = pandora.sample_fits_telemetry_to_integrations(
+	fits_path,
+	integration_jd,
+	hdu_names=pca_params["telemetry_hdu_names"],
+)
+
+_tel_cols = []
+for _k, _v in _tel_series.items():
+	if np.all(np.isfinite(_v)) and np.nanstd(_v) > 0:
+		_tel_cols.append((_v - np.nanmean(_v)) / np.nanstd(_v))
+
+if len(_tel_cols) == 0:
+	print("WARNING: No usable telemetry columns found for PCA decorrelation.")
+	white_light_pca = white_light_clean.copy()
+else:
+	_tel_matrix = np.column_stack(_tel_cols)
+	_u, _s_svd, _vh = np.linalg.svd(_tel_matrix, full_matrices=False)
+	_n_comp = min(pca_params["n_components"], _u.shape[1])
+	_pca_comps = _u[:, :_n_comp]
+	print(f"PCA: using {_n_comp} components from {len(_tel_cols)} telemetry channels.")
+
+	# Build design matrix for the kept integrations only.
+	_valid = integration_keep_mask.copy()
+	_t_rel = integration_jd - np.nanmedian(integration_jd[_valid])
+	_bg_per_int = np.nanmedian(extraction_info["background_per_pixel"], axis=1)
+
+	_poly_cols = [_t_rel ** p for p in range(pca_params["time_poly_order"] + 1)]
+	_X_full = np.column_stack(_poly_cols + [dx, dy, _bg_per_int] + [_pca_comps[:, c] for c in range(_n_comp)])
+
+	_X_oot = _X_full[_valid & oot_mask]
+	_y_oot = white_light_norm[_valid & oot_mask]
+
+	if _X_oot.shape[0] < _X_oot.shape[1] + 1:
+		print("WARNING: Too few OOT integrations for PCA fit; skipping decorrelation.")
+		white_light_pca = white_light_clean.copy()
+	else:
+		_c_pca, _, _, _ = np.linalg.lstsq(_X_oot, _y_oot, rcond=None)
+		_baseline_full = _X_full @ _c_pca
+
+		_wl_valid = white_light_norm[_valid]
+		_base_valid = _baseline_full[_valid]
+		_oot_valid = oot_mask[_valid]
+
+		_detrended = _wl_valid / _base_valid
+		_detrended /= np.nanmedian(_detrended[_oot_valid])
+
+		white_light_pca = np.full(nint, np.nan)
+		white_light_pca[_valid] = _detrended
+
+		pca_oot_scatter_ppm = 1.0e6 * np.nanstd(_detrended[_oot_valid])
+		raw_oot_scatter_ppm = 1.0e6 * np.nanstd(_wl_valid[_oot_valid])
+		print(f"OOT scatter before PCA detrending: {raw_oot_scatter_ppm:.1f} ppm")
+		print(f"OOT scatter  after PCA detrending: {pca_oot_scatter_ppm:.1f} ppm")
+
+		# Diagnostic plot: raw + systematic model + detrended (offset -0.05).
+		_t_plot = integration_jd[_valid]
+		fig, ax = plt.subplots(figsize=(11, 4.5))
+		ax.scatter(_t_plot, _wl_valid, color="0.6", s=6, label="Raw normalised")
+		ax.plot(_t_plot, _base_valid, color="tab:red", lw=1.2, alpha=0.7, label="Systematic model")
+		ax.scatter(_t_plot, _detrended - 0.05, color="tab:green", s=6, label="Detrended (−0.05 offset)")
+		ax.axhline(1.0, color="k", ls=":", lw=1)
+		ax.axhline(0.95, color="k", ls=":", lw=1)
+		ax.axvline(event_center_jd, color="tab:blue", lw=1.2, ls="--", label="Predicted mid-transit")
+		ax.axvspan(event_ingress_jd, event_egress_jd, color="tab:blue", alpha=0.14, label="Predicted T14")
+		ax.set_xlabel("JD")
+		ax.set_ylabel("Normalized white-light flux")
+		ax.set_ylim(0.92, 1.05)
+		ax.set_title("WASP-178b — PCA-detrended white-light curve")
+		ax.legend(loc="best", fontsize=8)
+		plt.tight_layout()
+		plt.show()
 # %%
 anim = pandora.animate_datacube(
 	slope_cube_cr_corrected,
@@ -537,17 +665,8 @@ plt.legend(loc="best", fontsize=8)
 plt.show()
 # %%
 # Plot normalized white-light flux in JD with predicted WASP-176b event markers.
-ephem_params = {
-	"period_days": 3.3448285,
-	"t0_hjd_utc": 2456927.06839,
-	"t14_hours": 3.470,
-}
-
-epoch_nearest = int(np.rint((np.nanmedian(integration_jd) - ephem_params["t0_hjd_utc"]) / ephem_params["period_days"]))
-event_center_jd = ephem_params["t0_hjd_utc"] + epoch_nearest * ephem_params["period_days"]
-t14_days = ephem_params["t14_hours"] / 24.0
-event_ingress_jd = event_center_jd - 0.5 * t14_days
-event_egress_jd = event_center_jd + 0.5 * t14_days
+# event_center_jd / event_ingress_jd / event_egress_jd computed in PCA cell above.
+epoch_nearest = _epoch
 
 plt.figure(figsize=(10, 4))
 plt.scatter(integration_jd, white_light_norm, color="0.6", label="All integrations", s=7)

@@ -1,6 +1,5 @@
 .pandora_rdf
 __pycache__/
 output.png
-slope_cube_repaired.mp4
 EPHEMERIS_LOOKUP_GUIDE.txt
 transit_ephemeris.py

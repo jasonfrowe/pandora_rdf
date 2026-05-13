@@ -110,6 +110,16 @@ ephem_params = {
 	"t14_hours": 3.470,
 }
 
+# Physical transit model parameters for WASP-178b.
+# Limb darkening u1/u2 for ~1.2 μm, Teff≈9350K (A1V), logg≈4.0 (Claret 2017 near-IR).
+transit_params = {
+	"a_over_Rstar": 7.17,       # Semi-major axis / stellar radius
+	"b": 0.54,                  # Impact parameter
+	"rp_over_Rstar": 0.11066,   # Planet radius / stellar radius
+	"u1": 0.10,                 # Quadratic LD u1 (~1.2 μm, A1V host)
+	"u2": 0.20,                 # Quadratic LD u2
+}
+
 # %%
 ramp_cube, science_header = pandora.read_rdf_raw_science(fits_path)
 cube = pandora.flatten_ramp_cube(ramp_cube)
@@ -263,9 +273,6 @@ if cr_params["plot_counts_vs_integration"]:
 		f"median={cr_stats['median']:.1f}, p95={cr_stats['p95']:.1f}, "
 		f"max={cr_stats['max']} at integration {cr_stats['argmax']}"
 	)
-# %%
-
-
 
 # %%
 pandora.display_correction_comparison(
@@ -700,6 +707,119 @@ print(
 	f"Predicted WASP-176b event in this time window: center JD={event_center_jd:.6f}, "
 	f"ingress={event_ingress_jd:.6f}, egress={event_egress_jd:.6f}"
 )
+# %%
+# Transit model overlay on PCA-detrended white-light curve (WASP-178b).
+import pytfit5.transitmodel as tm
+
+# Derive stellar density (g/cm³) from a/R* and period using Kepler's 3rd law.
+_a_rs = transit_params["a_over_Rstar"]
+_per_s = ephem_params["period_days"] * 86400.0
+_rho_gcc = (_a_rs**3 * 3.0 * np.pi
+		   / (1000.0 * 6.674e-11 * _per_s**2))
+
+# Convert standard u1/u2 to Kipping (2013) q1/q2 parameterisation used by pytfit5.
+_u1, _u2 = transit_params["u1"], transit_params["u2"]
+_q1 = (_u1 + _u2) ** 2
+_q2 = _u1 / (2.0 * (_u1 + _u2))
+
+# Build transit model solution object.
+sol_transit = tm.transit_model_class()
+sol_transit.npl   = 1
+sol_transit.rho   = _rho_gcc
+sol_transit.nl3   = _q1           # Kipping q1
+sol_transit.nl4   = _q2           # Kipping q2
+sol_transit.t0    = [event_center_jd]
+sol_transit.per   = [ephem_params["period_days"]]
+sol_transit.bb    = [transit_params["b"]]
+sol_transit.rdr   = [transit_params["rp_over_Rstar"]]
+sol_transit.ecw   = [0.0]
+sol_transit.esw   = [0.0]
+sol_transit.zpt   = 0.0
+sol_transit.dil   = 0.0
+
+print(
+	f"Transit model: ρ*={_rho_gcc:.4f} g/cm³, a/R*={_a_rs:.2f}, "
+	f"depth={(transit_params['rp_over_Rstar']**2)*1e6:.0f} ppm"
+)
+
+# Integration time per point (days); fall back to 2-min default if unavailable.
+_itime_days = (
+	np.asarray(exposure_time_s, dtype=float) / 86400.0
+	if exposure_time_s is not None
+	else np.full(len(integration_jd), 2.0 / 1440.0)
+)
+
+# Evaluate model at each data timestamp.
+_model_data = tm.transitModel(sol_transit, integration_jd, _itime_days, nintg=41)
+
+# Fine-sampled model curve for a smooth overlay.
+_jd_fine = np.linspace(integration_jd.min(), integration_jd.max(), 3000)
+_itime_fine = np.full(3000, float(np.nanmedian(_itime_days)))
+_model_fine = tm.transitModel(sol_transit, _jd_fine, _itime_fine, nintg=41)
+
+# Residuals on kept integrations.
+_keep = integration_keep_mask
+_resid_pca = white_light_pca[_keep] - _model_data[_keep]
+_oot_keep = oot_mask[_keep]
+_resid_rms_ppm = 1.0e6 * np.nanstd(_resid_pca[_oot_keep])
+
+fig, axes = plt.subplots(
+	2, 1, figsize=(11, 7), sharex=True,
+	gridspec_kw={"height_ratios": [3, 1]},
+)
+ax0 = axes[0]
+ax0.scatter(integration_jd, white_light_pca, color="tab:orange", s=7,
+			label="PCA-detrended", zorder=2)
+ax0.plot(_jd_fine, _model_fine, color="tab:red", lw=1.5,
+		 label="Transit model", zorder=3)
+ax0.axhline(1.0, color="k", ls=":", lw=0.8)
+ax0.axvline(event_center_jd, color="tab:blue", lw=1.0, ls="--", alpha=0.6)
+ax0.axvspan(event_ingress_jd, event_egress_jd, color="tab:blue", alpha=0.10,
+			 label="Predicted T14")
+ax0.set_ylabel("Normalized flux")
+ax0.set_ylim(0.97, 1.03)
+ax0.set_title(
+	f"WASP-178b  |  a/R*={_a_rs:.2f}, b={transit_params['b']:.2f}, "
+	f"Rp/R*={transit_params['rp_over_Rstar']:.5f}, ρ*={_rho_gcc:.3f} g/cm³"
+)
+ax0.legend(loc="best", fontsize=8)
+
+ax1 = axes[1]
+ax1.scatter(
+	integration_jd[_keep], _resid_pca * 1.0e6,
+	color="tab:orange", s=5, label="Residual",
+)
+ax1.axhline(0.0, color="k", ls=":", lw=0.8)
+ax1.set_ylabel("Residual (ppm)")
+ax1.set_xlabel("JD")
+ax1.set_title(f"OOT residuals RMS = {_resid_rms_ppm:.1f} ppm")
+plt.tight_layout()
+plt.show()
+# %%
+# Save transit model (fine-sampled) and data-point model to CSV files.
+import os
+
+_transit_csv_dir = os.path.dirname(fits_path)
+_transit_fine_csv = os.path.join(_transit_csv_dir, "wasp178b_transit_model_fine.csv")
+_transit_data_csv = os.path.join(_transit_csv_dir, "wasp178b_transit_model_data.csv")
+
+np.savetxt(
+	_transit_fine_csv,
+	np.column_stack([_jd_fine, _model_fine]),
+	delimiter=",",
+	header="time_jd,flux",
+	comments="",
+)
+print(f"Saved fine transit model ({len(_jd_fine)} points): {_transit_fine_csv}")
+
+np.savetxt(
+	_transit_data_csv,
+	np.column_stack([integration_jd, _model_data]),
+	delimiter=",",
+	header="time_jd,flux",
+	comments="",
+)
+print(f"Saved per-integration transit model ({len(integration_jd)} points): {_transit_data_csv}")
 # %%
 # Explore scatter drivers: photometry vs motion, fit residuals, and spacecraft telemetry.
 telemetry_channels = pandora.list_fits_telemetry_channels(fits_path)

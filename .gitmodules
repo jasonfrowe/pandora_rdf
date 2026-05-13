@@ -1,0 +1,3 @@
+[submodule "bls_cuda"]
+	path = bls_cuda
+	url = https://github.com/jasonfrowe/bls_cuda

@@ -668,17 +668,31 @@ plt.show()
 # event_center_jd / event_ingress_jd / event_egress_jd computed in PCA cell above.
 epoch_nearest = _epoch
 
-plt.figure(figsize=(10, 4))
-plt.scatter(integration_jd, white_light_norm, color="0.6", label="All integrations", s=7)
-plt.scatter(integration_jd, white_light_clean, color="tab:green", label="Kept integrations", s=7)
-plt.axhline(1.0, color="k", ls=":", lw=1)
-plt.axvline(event_center_jd, color="tab:blue", lw=1.2, ls="--", label="Predicted mid-transit")
-plt.axvspan(event_ingress_jd, event_egress_jd, color="tab:blue", alpha=0.14, label="Predicted T14 window")
-plt.xlabel("JD")
-plt.ylabel("Normalized white-light flux")
-plt.ylim(0.97, 1.03)
-plt.title(f"WASP-176b predicted event (epoch {epoch_nearest:+d})")
-plt.legend(loc="best", fontsize=8)
+fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+
+ax0 = axes[0]
+ax0.scatter(integration_jd, white_light_norm, color="0.6", label="All integrations", s=7)
+ax0.scatter(integration_jd, white_light_clean, color="tab:green", label="Kept integrations", s=7)
+ax0.axhline(1.0, color="k", ls=":", lw=1)
+ax0.axvline(event_center_jd, color="tab:blue", lw=1.2, ls="--", label="Predicted mid-transit")
+ax0.axvspan(event_ingress_jd, event_egress_jd, color="tab:blue", alpha=0.14, label="Predicted T14 window")
+ax0.set_ylabel("Normalized white-light flux")
+ax0.set_ylim(0.97, 1.03)
+ax0.set_title(f"WASP-176b — raw white-light (epoch {epoch_nearest:+d})")
+ax0.legend(loc="best", fontsize=8)
+
+ax1 = axes[1]
+ax1.scatter(integration_jd, white_light_norm, color="0.6", label="Raw (all)", s=7)
+ax1.scatter(integration_jd, white_light_pca, color="tab:orange", label="PCA-detrended", s=7)
+ax1.axhline(1.0, color="k", ls=":", lw=1)
+ax1.axvline(event_center_jd, color="tab:blue", lw=1.2, ls="--", label="Predicted mid-transit")
+ax1.axvspan(event_ingress_jd, event_egress_jd, color="tab:blue", alpha=0.14, label="Predicted T14 window")
+ax1.set_xlabel("JD")
+ax1.set_ylabel("Normalized white-light flux")
+ax1.set_ylim(0.97, 1.03)
+ax1.set_title(f"WASP-176b — PCA-detrended white-light (epoch {epoch_nearest:+d})")
+ax1.legend(loc="best", fontsize=8)
+
 plt.tight_layout()
 plt.show()
 

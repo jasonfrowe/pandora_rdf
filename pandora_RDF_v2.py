@@ -352,6 +352,8 @@ print(f"Extracted spectra shape: {extracted_spectra_masked.shape}  (integration 
 print(f"White-light stats: median={np.nanmedian(wl['white_light']):.6g}, std={np.nanstd(wl['white_light']):.6g}")
 print(f"Pointing drift: dx rms={np.nanstd(dx):.4f} pix, dy rms={np.nanstd(dy):.4f} pix")
 
+integration_jd = np.asarray(time_jd_cube[:, -1], dtype=float)
+
 pandora.plot_spectrophotometry_diagnostics(
     extracted_dispersion, median_spectrum, channel_good,
     integration_time_axis, white_light_norm, white_light_clean,
@@ -534,9 +536,39 @@ plt.ylim(0.97, 1.03)
 plt.legend(loc="best", fontsize=8)
 plt.show()
 # %%
-# Explore scatter drivers: photometry vs motion, fit residuals, and spacecraft telemetry.
-integration_jd = np.asarray(time_jd_cube[:, -1], dtype=float)
+# Plot normalized white-light flux in JD with predicted WASP-176b event markers.
+ephem_params = {
+	"period_days": 3.3448285,
+	"t0_hjd_utc": 2456927.06839,
+	"t14_hours": 3.470,
+}
 
+epoch_nearest = int(np.rint((np.nanmedian(integration_jd) - ephem_params["t0_hjd_utc"]) / ephem_params["period_days"]))
+event_center_jd = ephem_params["t0_hjd_utc"] + epoch_nearest * ephem_params["period_days"]
+t14_days = ephem_params["t14_hours"] / 24.0
+event_ingress_jd = event_center_jd - 0.5 * t14_days
+event_egress_jd = event_center_jd + 0.5 * t14_days
+
+plt.figure(figsize=(10, 4))
+plt.scatter(integration_jd, white_light_norm, color="0.6", label="All integrations", s=7)
+plt.scatter(integration_jd, white_light_clean, color="tab:green", label="Kept integrations", s=7)
+plt.axhline(1.0, color="k", ls=":", lw=1)
+plt.axvline(event_center_jd, color="tab:blue", lw=1.2, ls="--", label="Predicted mid-transit")
+plt.axvspan(event_ingress_jd, event_egress_jd, color="tab:blue", alpha=0.14, label="Predicted T14 window")
+plt.xlabel("JD")
+plt.ylabel("Normalized white-light flux")
+plt.ylim(0.97, 1.03)
+plt.title(f"WASP-176b predicted event (epoch {epoch_nearest:+d})")
+plt.legend(loc="best", fontsize=8)
+plt.tight_layout()
+plt.show()
+
+print(
+	f"Predicted WASP-176b event in this time window: center JD={event_center_jd:.6f}, "
+	f"ingress={event_ingress_jd:.6f}, egress={event_egress_jd:.6f}"
+)
+# %%
+# Explore scatter drivers: photometry vs motion, fit residuals, and spacecraft telemetry.
 telemetry_channels = pandora.list_fits_telemetry_channels(fits_path)
 print("Available table telemetry channels by HDU:")
 for hname, cols in telemetry_channels.items():

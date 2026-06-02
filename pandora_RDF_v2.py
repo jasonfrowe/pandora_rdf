@@ -20,6 +20,8 @@ try:
 except Exception:
 	pass
 # %%
+print(1+1)
+# %%
 # location data products
 datadir = '/opt/data2/rowe/pandora/2026/RDF1/data/'
 science_file = 'Pandora_RDF_WASP-178b_all.fits'
@@ -29,7 +31,7 @@ fits_path = datadir + science_file
 badpix_params = {
 	"min_intercept_offset_dn": 250.0,
 	"intercept_sigma": 10.0,
-	"slope_percentile": 0.5,
+	"slope_percentile": 2.0,  # Increased from 0.5 - less aggressive after timing fix
 	"scatter_sigma": 10.0,
 	"core_dilate_iterations": 0,
 	# Tune this to control how far we repair residual bright wings around bad cores.
@@ -47,7 +49,7 @@ badpix_params = {
 
 cr_params = {
 	"window_frames": 9,
-	"sigma": 4.5,
+	"sigma": 5.0,  # Increased from 4.5 - less aggressive after timing fix  
 	"min_neighbors": 3,
 	"positive_only": True,
 	"plot_counts_vs_integration": True,
@@ -146,8 +148,10 @@ print(
 # %%
 pandora.display_science_image(cube, image_index=269, scale_style="zscale", iraf_contrast=0.99)
 # %%
+# Compute ramp fits using CORRECTED method with actual exposure times
 fit_products_pre = pandora.compute_ramp_fit_products_r2s(
 	ramp_cube,
+	exposure_time_s=exposure_time_s[:ngroup],  # Pass actual times to fix 11% bias
 	sigcut=2.0,
 )
 # %%
@@ -222,6 +226,7 @@ ax.set_ylabel("Spatial pixel")
 cb = fig.colorbar(im, ax=ax, ticks=[0, 1, 2, 3])
 cb.ax.set_yticklabels(["good", "hot-only", "core", "wing"])
 plt.tight_layout()
+plt.savefig('images/pixel_status_map.png')
 plt.show()
 # %%
 slope_cube = fit_products_pre["slope"]
@@ -314,6 +319,7 @@ print(f"Photometric aperture pixels: {int(np.sum(aperture_model['aperture_mask']
 
 pandora.plot_spatial_profile(trace_est, trace_params)
 pandora.plot_aperture_overlay(slope_cube_cr_corrected, aperture_model, trace_est)
+plt.savefig('images/aperture_overlay.png')
 # %%
 # Perform spectrophotometric extraction.
 photometry_bad_mask = repair_mask
@@ -399,6 +405,15 @@ if gap_params["manual_bad_indices"]:
 white_light_clean = white_light_norm.copy()
 white_light_clean[~integration_keep_mask] = np.nan
 
+noise_budget = pandora.compute_noise_budget_summary(
+	white_light_clean,
+	oot_mask,
+	median_background_per_pixel,
+	integration_time_axis=integration_time_axis,
+	initial_frames=gap_params["initial_frames"],
+	burn_in_consecutive_frames=5,
+)
+
 print(
     f"Clean white-light: kept {int(np.sum(integration_keep_mask))}/{integration_keep_mask.size} integrations, "
     f"excluded {int(np.sum(~integration_keep_mask))} excursions."
@@ -406,6 +421,27 @@ print(
 print(f"Extracted spectra shape: {extracted_spectra_masked.shape}  (integration × dispersion)")
 print(f"White-light stats: median={np.nanmedian(wl['white_light']):.6g}, std={np.nanstd(wl['white_light']):.6g}")
 print(f"Pointing drift: dx rms={np.nanstd(dx):.4f} pix, dy rms={np.nanstd(dy):.4f} pix")
+print(f"OOT white-light RMS: {noise_budget['oot_rms_ppm']:.1f} ppm (MAD-equivalent {noise_budget['oot_mad_ppm']:.1f} ppm)")
+if noise_budget["background_rate_per_pixel"] is not None:
+	print(
+		"Background: "
+		f"median={np.nanmedian(noise_budget['background_per_pixel']):.6g} counts/pix/integration, "
+		f"rate={np.nanmedian(noise_budget['background_rate_per_pixel']):.6g} counts/pix/s"
+	)
+else:
+	print(
+		"Background: "
+		f"median={np.nanmedian(noise_budget['background_per_pixel']):.6g} counts/pix/integration"
+	)
+if noise_budget["burn_in_time_s"] is not None:
+	print(
+		"Burn-in estimate: "
+		f"{noise_budget['burn_in_frames']} frames (~{noise_budget['burn_in_time_s']:.2f} s) "
+		f"to settle within {1.0e6 * noise_budget['burn_threshold']:.1f} ppm"
+	)
+	print(f"Persistence excess in first integrations: {noise_budget['persistence_excess_ppm']:.1f} ppm")
+else:
+	print("Burn-in estimate: insufficient stable out-of-transit baseline to measure settling time")
 
 pandora.plot_spectrophotometry_diagnostics(
     extracted_dispersion, median_spectrum, channel_good,
@@ -476,8 +512,10 @@ else:
 
 		pca_oot_scatter_ppm = 1.0e6 * np.nanstd(_detrended[_oot_valid])
 		raw_oot_scatter_ppm = 1.0e6 * np.nanstd(_wl_valid[_oot_valid])
+		pca_reduction_pct = 100.0 * (1.0 - (pca_oot_scatter_ppm / raw_oot_scatter_ppm)) if raw_oot_scatter_ppm > 0 else np.nan
 		print(f"OOT scatter before PCA detrending: {raw_oot_scatter_ppm:.1f} ppm")
 		print(f"OOT scatter  after PCA detrending: {pca_oot_scatter_ppm:.1f} ppm")
+		print(f"PCA detrending reduced OOT scatter by {pca_reduction_pct:.1f}%")
 
 		# Diagnostic plot: raw + systematic model + detrended (offset -0.05).
 		_t_plot = integration_jd[_valid]
@@ -495,6 +533,7 @@ else:
 		ax.set_title("WASP-178b — PCA-detrended white-light curve")
 		ax.legend(loc="best", fontsize=8)
 		plt.tight_layout()
+		plt.savefig('images/pca_lightcurve.png')
 		plt.show()
 # %%
 anim = pandora.animate_datacube(
@@ -794,6 +833,7 @@ ax1.set_ylabel("Residual (ppm)")
 ax1.set_xlabel("JD")
 ax1.set_title(f"OOT residuals RMS = {_resid_rms_ppm:.1f} ppm")
 plt.tight_layout()
+plt.savefig('images/transit_model_fit.png')
 plt.show()
 # %%
 # Save transit model (fine-sampled) and data-point model to CSV files.
@@ -880,4 +920,18 @@ pandora.plot_multimetric_correlation_and_pca(
 	white_light_norm=white_light_norm,
 	max_labels=diagnostic_params["max_plot_labels"],
 )
+plt.savefig('images/multimetric_diag.png')
+# %%
+# Identify large gaps (> 20 minutes) in the time series
+gap_threshold_s = 20 * 60  # 20 minutes in seconds
+dt_s = np.diff(integration_jd) * 86400.0
+large_gap_indices = np.where(dt_s > gap_threshold_s)[0]
+
+print(f"Detected {len(large_gap_indices)} gaps longer than 20 minutes:\n")
+for idx in large_gap_indices:
+    gap_duration_min = dt_s[idx] / 60.0
+    print(f"Gap {idx}: Between index {idx} and {idx+1}")
+    print(f"  Duration: {gap_duration_min:.2f} minutes")
+    print(f"  Time Jump: {integration_jd[idx]:.6f} -> {integration_jd[idx+1]:.6f}")
+    print("-" * 40)
 # %%

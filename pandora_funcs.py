@@ -1284,6 +1284,136 @@ def compute_white_light_products(
     }
 
 
+def compute_noise_budget_summary(
+    white_light_norm,
+    oot_mask,
+    median_background_per_pixel,
+    integration_time_axis=None,
+    initial_frames=6,
+    burn_in_consecutive_frames=5,
+):
+    """Summarize the dominant white-light and background noise terms.
+
+    Parameters
+    ----------
+    white_light_norm : 1D array
+        Normalized white-light flux.
+    oot_mask : 1D bool array
+        True for out-of-transit integrations.
+    median_background_per_pixel : 1D array
+        Median background level per dispersion channel, in detector counts per
+        pixel per integration.
+    integration_time_axis : 1D array or None
+        Integration timestamps or cadence axis in seconds. If provided, an
+        approximate background rate per second is derived from the median
+        positive time step.
+    initial_frames : int
+        Leading integrations used to assess detector burn-in.
+    burn_in_consecutive_frames : int
+        Number of consecutive integrations required to declare the burn-in
+        settled.
+
+    Returns
+    -------
+    dict
+        Summary statistics for the noise budget.
+    """
+    wl = np.asarray(white_light_norm, dtype=float).reshape(-1)
+    oot = np.asarray(oot_mask, dtype=bool).reshape(-1)
+    bg = np.asarray(median_background_per_pixel, dtype=float).reshape(-1)
+
+    if wl.shape != oot.shape:
+        raise ValueError(f"white_light_norm shape {wl.shape} must match oot_mask shape {oot.shape}.")
+
+    finite = np.isfinite(wl) & oot
+    if not np.any(finite):
+        finite = np.isfinite(wl)
+
+    oot_vals = wl[finite]
+    oot_median = float(np.nanmedian(oot_vals)) if oot_vals.size else float("nan")
+    oot_resid = wl[finite] - oot_median if oot_vals.size else np.array([], dtype=float)
+
+    if oot_resid.size:
+        oot_rms_ppm = 1.0e6 * float(np.nanstd(oot_resid))
+        mad = float(np.nanmedian(np.abs(oot_resid - np.nanmedian(oot_resid))))
+        oot_mad_ppm = 1.0e6 * 1.4826 * mad
+    else:
+        oot_rms_ppm = float("nan")
+        oot_mad_ppm = float("nan")
+
+    burn_start = max(0, int(initial_frames))
+    if integration_time_axis is None:
+        time_axis = np.arange(wl.size, dtype=float)
+    else:
+        time_axis = np.asarray(integration_time_axis, dtype=float).reshape(-1)
+        if time_axis.shape != wl.shape:
+            raise ValueError(f"integration_time_axis shape {time_axis.shape} must match white_light_norm shape {wl.shape}.")
+
+    lead_limit = int(np.argmax(~oot)) if np.any(~oot) else wl.size
+    lead_limit = max(lead_limit, burn_start + 1)
+
+    burn_reference = wl[burn_start:lead_limit]
+    burn_reference = burn_reference[np.isfinite(burn_reference)]
+    if burn_reference.size:
+        burn_baseline = float(np.nanmedian(burn_reference))
+        burn_resid = burn_reference - burn_baseline
+        burn_sigma = float(np.nanstd(burn_resid))
+        if not np.isfinite(burn_sigma) or burn_sigma <= 0:
+            mad = float(np.nanmedian(np.abs(burn_resid - np.nanmedian(burn_resid))))
+            burn_sigma = 1.4826 * mad
+        if not np.isfinite(burn_sigma) or burn_sigma <= 0:
+            burn_sigma = 1.0e-6
+        burn_threshold = 3.0 * burn_sigma
+
+        settled_index = None
+        last_start = max(burn_start, lead_limit - 1)
+        for idx in range(burn_start, last_start + 1):
+            window = wl[idx : idx + int(burn_in_consecutive_frames)]
+            if window.size < int(burn_in_consecutive_frames):
+                break
+            if np.all(np.isfinite(window)) and np.all(np.abs(window - burn_baseline) <= burn_threshold):
+                settled_index = idx
+                break
+        if settled_index is None:
+            burn_in_frames = None
+            burn_in_time_s = None
+        else:
+            burn_in_frames = int(settled_index - burn_start)
+            burn_in_time_s = float(time_axis[settled_index] - time_axis[burn_start])
+        first_window = wl[burn_start : min(wl.size, burn_start + int(max(1, burn_in_consecutive_frames)))]
+        first_window = first_window[np.isfinite(first_window)]
+        persistence_excess_ppm = (
+            1.0e6 * float(np.nanmedian(first_window) - burn_baseline)
+            if first_window.size
+            else float("nan")
+        )
+    else:
+        burn_baseline = float("nan")
+        burn_threshold = float("nan")
+        burn_in_frames = None
+        burn_in_time_s = None
+        persistence_excess_ppm = float("nan")
+
+    finite_dt = np.diff(time_axis[np.isfinite(time_axis)])
+    finite_dt = finite_dt[finite_dt > 0]
+    integration_dt_s = float(np.nanmedian(finite_dt)) if finite_dt.size else None
+    background_rate_per_pixel = bg / integration_dt_s if integration_dt_s is not None else None
+
+    return {
+        "oot_median": oot_median,
+        "oot_rms_ppm": oot_rms_ppm,
+        "oot_mad_ppm": oot_mad_ppm,
+        "background_per_pixel": bg,
+        "background_rate_per_pixel": background_rate_per_pixel,
+        "integration_dt_s": integration_dt_s,
+        "burn_baseline": burn_baseline,
+        "burn_threshold": burn_threshold,
+        "burn_in_frames": burn_in_frames,
+        "burn_in_time_s": burn_in_time_s,
+        "persistence_excess_ppm": persistence_excess_ppm,
+    }
+
+
 def reject_photometric_excursions(
     white_light_norm,
     dx,
@@ -2277,20 +2407,200 @@ def plot_multimetric_correlation_and_pca(
         ax.set_axis_off()
 
     plt.show()
-    
-def compute_ramp_fit_products_r2s(ramp_cube, sigcut=2.0):
-	"""Compute robust ramp-fit products per integration using JWST-style r2s fitting.
 
-	Returns slope, intercept, and fit scatter images with shape
-	(integration, row, column).
+
+@njit
+def _r2s_stdev2(pts, mean):
+	"""Calculate standard deviation given pre-computed mean."""
+	var = 0.0
+	for i in range(len(pts)):
+		var += (pts[i] - mean) ** 2
+	if len(pts) > 0:
+		var /= len(pts)
+	return np.sqrt(var)
+
+
+@njit
+def _r2s_lfit(npt, x, y, sig, flag, dydxmean):
+	"""Linear fit with jump detection and correction for r2s."""
+	S = 0.0
+	Sx = 0.0
+	Sxx = 0.0
+	Sy = 0.0
+	Sxy = 0.0
+
+	dy = np.zeros(npt)
+
+	for i in range(npt):
+		if flag[i] == 1:
+			dy1 = y[i + 1] - y[i]
+			for j in range(i, npt):
+				dy[j + 1] += dy1 - dydxmean
+
+	for i in range(npt):
+		dsig2 = 1.0 / (sig[i] * sig[i])
+		S += dsig2
+		Sx += x[i] * dsig2
+		Sxx += x[i] * x[i] * dsig2
+		Sy += (y[i] - dy[i]) * dsig2
+		Sxy += x[i] * (y[i] - dy[i]) * dsig2
+
+	delta = S * Sxx - (Sx * Sx)
+	if delta != 0:
+		zpt = ((Sxx * Sy) - (Sx * Sxy)) / delta
+		slope = ((S * Sxy) - (Sx * Sy)) / delta
+	else:
+		zpt = 0
+		slope = 0
+
+	return zpt, slope
+
+
+@njit
+def _r2s_test_with_times(scidata, times, dq, nrsatmap, bpix=-1.0e30, sigcut=2.0):
 	"""
-	try:
-		import jwst_soss_reduction as soss_red
-	except Exception as exc:
-		raise ImportError(
-			"jwst_soss_reduction.py is required for r2s-style ramp fitting."
-		) from exc
+	Modified r2s_test that uses actual exposure times instead of group indices.
+	
+	This corrects the systematic bias from using group indices (1,2,3,...)
+	instead of actual exposure times (e.g., 0.92, 8.30, 15.68, ... seconds).
+	"""
+	nr = scidata.shape[0]
+	n1 = scidata.shape[1]
+	n2 = scidata.shape[2]
 
+	x = np.zeros(nr)
+	y = np.zeros(nr)
+	ysig = np.zeros(nr)
+	rflag = np.zeros(nr, dtype=np.int32)
+	dydx = np.zeros(nr - 1)
+	dydx_cut = np.zeros(nr - 1)
+
+	zpt = np.zeros((n1, n2))
+	stdimage = np.zeros((n1, n2))
+	image = np.zeros((n1, n2))
+	bpixmap = np.zeros((n1, n2))
+
+	for i in range(n1):
+		for j in range(n2):
+			if (dq[i, j] & 1) == 0:
+				npt = 0
+
+				for k in range(nrsatmap[i, j]):
+					if scidata[k, i, j] > bpix:
+						npt += 1
+						# KEY CHANGE: Use actual exposure time instead of group index
+						x[npt - 1] = times[k]
+						y[npt - 1] = scidata[k, i, j] * 1.0
+						ysig[npt - 1] = np.sqrt(np.abs(scidata[k, i, j])) + 1.0e-5
+						rflag[npt - 1] = 0
+
+				if npt >= 3:
+					ndydx = npt - 1
+					for k in range(ndydx):
+						dydx[k] = (y[k + 1] - y[k]) / (x[k + 1] - x[k])
+
+					mean = np.median(dydx[0:ndydx])
+					std = _r2s_stdev2(dydx[0:ndydx], mean)
+
+					zpt[i, j], image[i, j] = _r2s_lfit(npt, x, y, ysig, rflag, mean)
+
+					icut = 0
+					icut_old = -1
+					while icut != icut_old:
+						npt_cut = 0
+						icut_old = icut
+						icut = 0
+						for k in range(ndydx):
+							if np.abs(dydx[k] - mean) < sigcut * std:
+								npt_cut += 1
+								dydx_cut[npt_cut - 1] = dydx[k]
+								rflag[k] = 0
+							else:
+								icut += 1
+								rflag[k] = 1
+
+						if npt_cut > 1:
+							mean = np.mean(dydx_cut[0:npt_cut])
+							std = np.std(dydx_cut[0:npt_cut])
+							zpt[i, j], image[i, j] = _r2s_lfit(npt, x, y, ysig, rflag, mean)
+
+					stdimage[i, j] = std
+
+				elif npt == 0:
+					zpt[i, j] = 0.0
+					stdimage[i, j] = 0.0
+					image[i, j] = 0.0
+
+				else:
+					zpt[i, j] = scidata[0, i, j] * 1.0
+					stdimage[i, j] = 0.0
+					if nrsatmap[i, j] > 0 and times[nrsatmap[i, j] - 1] > 0:
+						image[i, j] = scidata[nrsatmap[i, j] - 1, i, j] / times[nrsatmap[i, j] - 1]
+					else:
+						image[i, j] = 0.0
+			else:
+				bpixmap[i, j] = 1
+
+	# Bad pixel filling
+	max_neighbors = n1 * n2
+	pixels = np.zeros(max_neighbors)
+
+	for i in range(n1):
+		for j in range(n2):
+			if bpixmap[i, j] > 0:
+				ng = 1
+				icor = 0
+				ng_max = n1 if n1 > n2 else n2
+
+				while icor == 0 and ng <= ng_max:
+					k = 0
+					i_start = 0 if i - ng < 0 else i - ng
+					i_stop = n1 if i + ng + 1 > n1 else i + ng + 1
+					j_start = 0 if j - ng < 0 else j - ng
+					j_stop = n2 if j + ng + 1 > n2 else j + ng + 1
+
+					for i2 in range(i_start, i_stop):
+						for j2 in range(j_start, j_stop):
+							if bpixmap[i2, j2] < 1:
+								pixels[k] = image[i2, j2]
+								k += 1
+					if k > 0:
+						image[i, j] = np.median(pixels[:k])
+						icor = 1
+					else:
+						ng += 1
+
+				if icor == 0:
+					image[i, j] = 0.0
+
+	return zpt, stdimage, image, bpixmap
+    
+
+def compute_ramp_fit_products_r2s(ramp_cube, exposure_time_s=None, sigcut=2.0):
+	"""Compute robust ramp-fit products per integration using JWST-style r2s fitting.
+	
+	This version corrects the systematic timing bias by using actual exposure times
+	instead of group indices.
+
+	Parameters
+	----------
+	ramp_cube : ndarray (nint, ngroup, ny, nx)
+		4D ramp data cube
+	exposure_time_s : ndarray (ngroup,) or (nint*ngroup,), optional
+		Actual exposure times for each group in seconds.
+		If None, falls back to group indices (NOT RECOMMENDED - causes ~11% bias)
+	sigcut : float
+		Sigma clipping threshold for outlier rejection
+
+	Returns
+	-------
+	dict with keys:
+		'intercept': ndarray (nint, ny, nx) - intercept at t=0 in DN
+		'slope': ndarray (nint, ny, nx) - slope in DN/s (if times given) or DN/group
+		'scatter': ndarray (nint, ny, nx) - fit scatter
+		'bpix': ndarray (nint, ny, nx) - bad pixel mask
+		'info': dict with metadata
+	"""
 	ramp = np.asarray(ramp_cube, dtype=float)
 	if ramp.ndim != 4:
 		raise ValueError(f"ramp_cube must be 4D, got shape {ramp.shape}.")
@@ -2304,23 +2614,69 @@ def compute_ramp_fit_products_r2s(ramp_cube, sigcut=2.0):
 	scatter_cube = np.zeros((nint, ny, nx), dtype=float)
 	bpix_cube = np.zeros((nint, ny, nx), dtype=np.int16)
 
-	for i in range(nint):
-		zpt, stdimage, slope, bpixmap = soss_red.r2s_test(
-			ramp[i],
-			dq,
-			nrsatmap,
-			sigcut=float(sigcut),
-		)
-		intercept_cube[i] = np.asarray(zpt, dtype=float)
-		slope_cube[i] = np.asarray(slope, dtype=float)
-		scatter_cube[i] = np.asarray(stdimage, dtype=float)
-		bpix_cube[i] = np.asarray(bpixmap, dtype=np.int16)
+	# Determine which fitting method to use
+	use_actual_times = (exposure_time_s is not None)
+	
+	if use_actual_times:
+		# Use corrected fitting with actual times
+		times = np.asarray(exposure_time_s, dtype=float)
+		if times.size == ngroup:
+			times_per_group = times
+		elif times.size == nint * ngroup:
+			times_per_group = times[:ngroup]
+		else:
+			raise ValueError(
+				f"exposure_time_s must have size {ngroup} or {nint*ngroup}, "
+				f"got {times.size}"
+			)
+		
+		print(f"Using CORRECTED r2s fitting with actual times: {times_per_group[:3]}... (DN/s)")
+		
+		for i in range(nint):
+			zpt, stdimage, slope, bpixmap = _r2s_test_with_times(
+				ramp[i],
+				times_per_group,
+				dq,
+				nrsatmap,
+				sigcut=float(sigcut),
+			)
+			intercept_cube[i] = np.asarray(zpt, dtype=float)
+			slope_cube[i] = np.asarray(slope, dtype=float)
+			scatter_cube[i] = np.asarray(stdimage, dtype=float)
+			bpix_cube[i] = np.asarray(bpixmap, dtype=np.int16)
+	else:
+		# Fall back to original method (NOT RECOMMENDED)
+		print("WARNING: Using group indices instead of actual times!")
+		print("         This causes systematic ~11% bias. Pass exposure_time_s to fix.")
+		
+		try:
+			import jwst_soss_reduction as soss_red
+		except Exception as exc:
+			raise ImportError(
+				"jwst_soss_reduction.py is required for r2s-style ramp fitting."
+			) from exc
+		
+		for i in range(nint):
+			zpt, stdimage, slope, bpixmap = soss_red.r2s_test(
+				ramp[i],
+				dq,
+				nrsatmap,
+				sigcut=float(sigcut),
+			)
+			intercept_cube[i] = np.asarray(zpt, dtype=float)
+			slope_cube[i] = np.asarray(slope, dtype=float)
+			scatter_cube[i] = np.asarray(stdimage, dtype=float)
+			bpix_cube[i] = np.asarray(bpixmap, dtype=np.int16)
 
 	info = {
 		"sigcut": float(sigcut),
 		"n_integrations": int(nint),
 		"n_groups": int(ngroup),
+		"uses_actual_times": use_actual_times,
 	}
+	
+	if use_actual_times:
+		info["time_range_s"] = (float(times_per_group[0]), float(times_per_group[-1]))
 
 	return {
 		"intercept": intercept_cube,

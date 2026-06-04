@@ -148,12 +148,18 @@ print(
 # %%
 pandora.display_science_image(cube, image_index=269, scale_style="zscale", iraf_contrast=0.99)
 # %%
-# Compute ramp fits using CORRECTED method with actual exposure times
+# Compute ramp fits using INDICES (stable), then scale to correct units
+# Using actual times causes noise amplification due to intercept extrapolation
 fit_products_pre = pandora.compute_ramp_fit_products_r2s(
 	ramp_cube,
-	exposure_time_s=exposure_time_s[:ngroup],  # Pass actual times to fix 11% bias
+	exposure_time_s=None,  # Use group indices (stable)
 	sigcut=2.0,
 )
+
+# Convert slopes from DN/group to DN/s by dividing by average group spacing
+group_spacing_s = np.mean(np.diff(exposure_time_s[:ngroup]))
+fit_products_pre["slope"] = fit_products_pre["slope"] / group_spacing_s
+print(f"Converted slopes from DN/group to DN/s (spacing={group_spacing_s:.4f}s)")
 # %%
 pandora.display_science_image(fit_products_pre["slope"], image_index=45, \
     scale_style="zscale", iraf_contrast=0.99)

@@ -185,7 +185,7 @@ def display_science_image(
 	ax.set_ylabel("Spatial pixel")
 	divider = make_axes_locatable(ax)
 	cax = divider.append_axes("right", size="2.5%", pad=0.05)
-	fig.colorbar(img, cax=cax, label="Counts")
+	fig.colorbar(img, cax=cax, label="Counts/sec")
 	plt.tight_layout()
 	plt.show()
 
@@ -2994,4 +2994,707 @@ def animate_datacube(
 		plt.tight_layout()
 		plt.show()
 
-	return anim
+
+def analyze_median_residual_ramp(ramp_cube, slope_cube, intercept_cube, times,
+                                  bad_pixel_mask=None,
+                                  flux_percentile_low=None, flux_percentile_high=None,
+                                  exclude_edge_rows=3, exclude_edge_cols=10,
+                                  title_suffix=""):
+	"""
+	Analyze median residual ramps to identify systematic patterns like persistence or non-linearity.
+	
+	Parameters
+	----------
+	ramp_cube : ndarray (nint, ngroup, nrow, ncol)
+		Raw ramp data
+	slope_cube : ndarray (nint, nrow, ncol)
+		Fitted slopes in DN/s
+	intercept_cube : ndarray (nint, nrow, ncol)
+		Fitted intercepts in DN
+	times : array-like (ngroup,)
+		Exposure times for each group in seconds
+	bad_pixel_mask : ndarray (nrow, ncol), optional
+		Boolean mask where True = bad pixel to exclude
+	flux_percentile_low : float, optional
+		Lower percentile for pixel selection (e.g., 10 = bottom 10%)
+	flux_percentile_high : float, optional
+		Upper percentile for pixel selection (e.g., 90 = top 90%)
+	exclude_edge_rows : int
+		Number of rows to exclude from top/bottom edges
+	exclude_edge_cols : int
+		Number of columns to exclude from left/right edges
+	title_suffix : str
+		Suffix for plot title
+	
+	Returns
+	-------
+	dict with diagnostic results
+	"""
+	nint, ngroup, nrow, ncol = ramp_cube.shape
+	times_arr = np.asarray(times)
+	
+	# Build pixel selection mask - start with all True
+	pixel_mask = np.ones((nrow, ncol), dtype=bool)
+	
+	# Exclude bad/hot pixels
+	if bad_pixel_mask is not None:
+		pixel_mask = pixel_mask & (~bad_pixel_mask)
+		n_bad_excluded = np.sum(bad_pixel_mask)
+		print(f"Excluding {n_bad_excluded} bad/hot pixels")
+	
+	# Exclude edge pixels
+	if exclude_edge_rows > 0:
+		pixel_mask[:exclude_edge_rows, :] = False
+		pixel_mask[-exclude_edge_rows:, :] = False
+		print(f"Excluding {exclude_edge_rows} rows from top/bottom edges")
+	
+	if exclude_edge_cols > 0:
+		pixel_mask[:, :exclude_edge_cols] = False
+		pixel_mask[:, -exclude_edge_cols:] = False
+		print(f"Excluding {exclude_edge_cols} columns from left/right edges")
+	
+	# Apply flux percentile filters on good pixels only
+	if flux_percentile_low is not None or flux_percentile_high is not None:
+		median_flux = np.nanmedian(slope_cube, axis=0)  # Median slope per pixel
+		
+		# Only consider good pixels for percentile calculation
+		median_flux_good = median_flux[pixel_mask]
+		
+		if flux_percentile_low is not None:
+			threshold_low = np.nanpercentile(median_flux_good, flux_percentile_low)
+			pixel_mask = pixel_mask & (median_flux >= threshold_low)
+			print(f"Selecting pixels >= {flux_percentile_low}th percentile (>{threshold_low:.1f} DN/s)")
+		
+		if flux_percentile_high is not None:
+			threshold_high = np.nanpercentile(median_flux_good, flux_percentile_high)
+			pixel_mask = pixel_mask & (median_flux <= threshold_high)
+			print(f"Selecting pixels <= {flux_percentile_high}th percentile (<{threshold_high:.1f} DN/s)")
+	
+	n_pixels = np.sum(pixel_mask)
+	print(f"Selected {n_pixels} pixels for residual analysis")
+	
+	if n_pixels == 0:
+		raise ValueError("No pixels selected with current criteria")
+	
+	# Compute residuals for all integrations
+	residuals_all = []
+	fitted_values_all = []
+	
+	pixel_coords = np.argwhere(pixel_mask)
+	
+	for row, col in pixel_coords:
+		for i in range(nint):
+			ramp = ramp_cube[i, :, row, col]
+			slope = slope_cube[i, row, col]
+			intercept = intercept_cube[i, row, col]
+			
+			if not np.isfinite(slope) or not np.isfinite(intercept):
+				continue
+			
+			fitted = slope * times_arr + intercept
+			residuals = ramp - fitted
+			
+			if np.all(np.isfinite(residuals)):
+				residuals_all.append(residuals)
+				fitted_values_all.append(fitted)
+	
+	if len(residuals_all) == 0:
+		raise ValueError("No valid residuals computed")
+	
+	residuals_arr = np.array(residuals_all)
+	fitted_arr = np.array(fitted_values_all)
+	
+	# Compute statistics across pixels and integrations
+	median_residual_dn = np.median(residuals_arr, axis=0)
+	std_residual_dn = np.std(residuals_arr, axis=0)
+	
+	# Compute as percentage of fitted value
+	median_fitted = np.median(fitted_arr, axis=0)
+	median_residual_pct = 100 * median_residual_dn / median_fitted
+	
+	# Compute per-group statistics
+	print(f"\nMedian residuals per group:")
+	for g in range(ngroup):
+		print(f"  Group {g} (t={times_arr[g]:.2f}s): "
+		      f"{median_residual_dn[g]:+.2f} DN ({median_residual_pct[g]:+.3f}%)")
+	
+	# Plot results
+	fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+	
+	# Top panel: Residuals in DN
+	ax = axes[0]
+	ax.errorbar(times_arr, median_residual_dn, yerr=std_residual_dn,
+	            fmt='o-', capsize=4, markersize=8, linewidth=2, 
+	            color='tab:blue', label='Median ± std')
+	ax.axhline(0, color='k', linestyle='--', linewidth=1, alpha=0.5)
+	ax.set_ylabel('Residual (DN)', fontsize=11)
+	ax.set_title(f'Median Residual Ramps{title_suffix}\n({n_pixels} pixels, {len(residuals_all)} samples)', 
+	             fontsize=12, fontweight='bold')
+	ax.legend(fontsize=9)
+	ax.grid(True, alpha=0.3)
+	
+	# Add persistence indicator if first group is significantly positive
+	if median_residual_dn[0] > 2 * std_residual_dn[0]:
+		ax.text(0.02, 0.98, '⚠ Possible persistence\n(excess in first group)', 
+		        transform=ax.transAxes, fontsize=9, verticalalignment='top',
+		        bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.3))
+	
+	# Bottom panel: Residuals as percentage
+	ax = axes[1]
+	ax.plot(times_arr, median_residual_pct, 'o-', 
+	        markersize=8, linewidth=2, color='tab:orange')
+	ax.axhline(0, color='k', linestyle='--', linewidth=1, alpha=0.5)
+	ax.set_xlabel('Time (s)', fontsize=11)
+	ax.set_ylabel('Residual (%)', fontsize=11)
+	ax.grid(True, alpha=0.3)
+	
+	# Add non-linearity indicator if systematic curvature
+	poly_fit = np.polyfit(times_arr, median_residual_pct, 2)
+	if abs(poly_fit[0]) > 0.001:  # Significant quadratic term
+		curvature = "upward" if poly_fit[0] > 0 else "downward"
+		ax.text(0.02, 0.98, f'⚠ Possible non-linearity\n({curvature} curvature)', 
+		        transform=ax.transAxes, fontsize=9, verticalalignment='top',
+		        bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.3))
+	
+	plt.tight_layout()
+	plt.savefig(f'images/median_residual_ramp{title_suffix.replace(" ", "_")}.png', dpi=150)
+	plt.show()
+	
+	return {
+		'median_residual_dn': median_residual_dn,
+		'median_residual_pct': median_residual_pct,
+		'std_residual_dn': std_residual_dn,
+		'median_fitted': median_fitted,
+		'n_pixels': n_pixels,
+		'n_samples': len(residuals_all),
+		'times': times_arr,
+	}
+
+
+def build_nonlinearity_correction(ramp_cube, slope_cube, intercept_cube, times,
+                                   bad_pixel_mask=None,
+                                   flux_percentile_low=50,
+                                   exclude_edge_rows=3, exclude_edge_cols=10,
+                                   poly_order=2):
+	"""
+	Build empirical non-linearity correction from median residuals of bright pixels.
+	
+	Uses bright pixels (good S/N) to measure the systematic non-linearity pattern,
+	then fits a polynomial to create a smooth correction function.
+	
+	Parameters
+	----------
+	ramp_cube : ndarray (nint, ngroup, nrow, ncol)
+		Raw ramp data
+	slope_cube : ndarray (nint, nrow, ncol)
+		Fitted slopes in DN/s
+	intercept_cube : ndarray (nint, nrow, ncol)
+		Fitted intercepts in DN
+	times : array-like (ngroup,)
+		Exposure times for each group in seconds
+	bad_pixel_mask : ndarray (nrow, ncol), optional
+		Boolean mask where True = bad pixel to exclude
+	flux_percentile_low : float
+		Lower percentile threshold for bright pixel selection (default 50 = top 50%)
+	exclude_edge_rows : int
+		Number of rows to exclude from top/bottom edges
+	exclude_edge_cols : int
+		Number of columns to exclude from left/right edges
+	poly_order : int
+		Polynomial order for correction (default 2 = quadratic)
+	
+	Returns
+	-------
+	correction_coeffs : ndarray
+		Polynomial coefficients (highest degree first, for np.polyval)
+	correction_info : dict
+		Diagnostic information including residuals and fit quality
+	"""
+	nint, ngroup, nrow, ncol = ramp_cube.shape
+	times_arr = np.asarray(times)
+	
+	# Build pixel selection mask for bright pixels
+	pixel_mask = np.ones((nrow, ncol), dtype=bool)
+	
+	# Exclude bad/hot pixels
+	if bad_pixel_mask is not None:
+		pixel_mask = pixel_mask & (~bad_pixel_mask)
+	
+	# Exclude edge pixels
+	if exclude_edge_rows > 0:
+		pixel_mask[:exclude_edge_rows, :] = False
+		pixel_mask[-exclude_edge_rows:, :] = False
+	
+	if exclude_edge_cols > 0:
+		pixel_mask[:, :exclude_edge_cols] = False
+		pixel_mask[:, -exclude_edge_cols:] = False
+	
+	# Select bright pixels (good S/N for measuring non-linearity)
+	median_flux = np.nanmedian(slope_cube, axis=0)
+	median_flux_good = median_flux[pixel_mask]
+	threshold_low = np.nanpercentile(median_flux_good, flux_percentile_low)
+	pixel_mask = pixel_mask & (median_flux >= threshold_low)
+	
+	n_pixels = np.sum(pixel_mask)
+	print(f"Building non-linearity correction from {n_pixels} bright pixels "
+	      f"(>= {flux_percentile_low}th percentile)")
+	
+	if n_pixels == 0:
+		raise ValueError("No pixels selected for non-linearity correction")
+	
+	# Compute residuals for selected pixels
+	residuals_all = []
+	fitted_values_all = []
+	
+	pixel_coords = np.argwhere(pixel_mask)
+	
+	for row, col in pixel_coords:
+		for i in range(nint):
+			ramp = ramp_cube[i, :, row, col]
+			slope = slope_cube[i, row, col]
+			intercept = intercept_cube[i, row, col]
+			
+			if not np.isfinite(slope) or not np.isfinite(intercept):
+				continue
+			
+			fitted = slope * times_arr + intercept
+			residuals = ramp - fitted
+			
+			if np.all(np.isfinite(residuals)):
+				residuals_all.append(residuals)
+				fitted_values_all.append(fitted)
+	
+	residuals_arr = np.array(residuals_all)
+	
+	# Compute median residuals
+	median_residual_dn = np.median(residuals_arr, axis=0)
+	std_residual_dn = np.std(residuals_arr, axis=0)
+	
+	# Fit polynomial to median residuals as function of time
+	# This gives us a smooth parametric correction
+	correction_coeffs = np.polyfit(times_arr, median_residual_dn, poly_order)
+	fitted_correction = np.polyval(correction_coeffs, times_arr)
+	
+	# Compute fit residuals
+	fit_residuals = median_residual_dn - fitted_correction
+	rms_residual = np.sqrt(np.mean(fit_residuals**2))
+	
+	print(f"Polynomial fit (order {poly_order}) RMS residual: {rms_residual:.2f} DN")
+	print(f"Correction coefficients: {correction_coeffs}")
+	
+	# Plot the correction
+	fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+	
+	# Top: Measured vs fitted correction
+	ax = axes[0]
+	ax.errorbar(times_arr, median_residual_dn, yerr=std_residual_dn,
+	            fmt='o', capsize=4, markersize=8, color='tab:blue', 
+	            label='Measured residuals', alpha=0.7)
+	ax.plot(times_arr, fitted_correction, '-', linewidth=3, 
+	        color='tab:red', label=f'Polynomial fit (order {poly_order})')
+	ax.axhline(0, color='k', linestyle='--', linewidth=1, alpha=0.5)
+	ax.set_ylabel('Non-linearity Correction (DN)', fontsize=11)
+	ax.set_title(f'Empirical Non-linearity Correction\n({n_pixels} pixels, {len(residuals_all)} samples)', 
+	             fontsize=12, fontweight='bold')
+	ax.legend(fontsize=10)
+	ax.grid(True, alpha=0.3)
+	
+	# Bottom: Fit residuals
+	ax = axes[1]
+	ax.plot(times_arr, fit_residuals, 'o-', markersize=8, linewidth=2, 
+	        color='tab:green')
+	ax.axhline(0, color='k', linestyle='--', linewidth=1, alpha=0.5)
+	ax.set_xlabel('Time (s)', fontsize=11)
+	ax.set_ylabel('Fit Residuals (DN)', fontsize=11)
+	ax.set_title(f'Polynomial Fit Quality (RMS = {rms_residual:.2f} DN)', fontsize=11)
+	ax.grid(True, alpha=0.3)
+	
+	plt.tight_layout()
+	plt.savefig('images/nonlinearity_correction.png', dpi=150)
+	plt.show()
+	
+	return correction_coeffs, {
+		'times': times_arr,
+		'median_residual_dn': median_residual_dn,
+		'std_residual_dn': std_residual_dn,
+		'fitted_correction': fitted_correction,
+		'fit_residuals': fit_residuals,
+		'rms_residual': rms_residual,
+		'n_pixels': n_pixels,
+		'n_samples': len(residuals_all),
+		'poly_order': poly_order,
+	}
+
+
+def apply_nonlinearity_correction(ramp_cube, times, correction_coeffs):
+	"""
+	Apply empirical non-linearity correction to ramp data.
+	
+	Subtracts the parametric non-linearity pattern from each ramp to 
+	linearize the detector response before slope fitting.
+	
+	Parameters
+	----------
+	ramp_cube : ndarray (nint, ngroup, nrow, ncol)
+		Raw ramp data to correct
+	times : array-like (ngroup,)
+		Exposure times for each group in seconds
+	correction_coeffs : ndarray
+		Polynomial coefficients from build_nonlinearity_correction
+	
+	Returns
+	-------
+	ramp_cube_corrected : ndarray (nint, ngroup, nrow, ncol), dtype=float64
+		Corrected ramp data with non-linearity removed (converted to float)
+	correction_applied : ndarray (ngroup,)
+		Correction values applied (for verification)
+	"""
+	nint, ngroup, nrow, ncol = ramp_cube.shape
+	times_arr = np.asarray(times)
+	
+	# Compute correction for each group
+	correction_dn = np.polyval(correction_coeffs, times_arr)
+	
+	print(f"Applying non-linearity correction to {nint} integrations...")
+	print("Correction per group:")
+	for g in range(ngroup):
+		print(f"  Group {g} (t={times_arr[g]:.2f}s): {correction_dn[g]:+.2f} DN")
+	
+	# Create corrected cube - convert to float to handle subtraction
+	# (residuals are data - model, so we subtract to remove them)
+	ramp_cube_corrected = ramp_cube.astype(np.float64)
+	
+	for g in range(ngroup):
+		ramp_cube_corrected[:, g, :, :] -= correction_dn[g]
+	
+	print("Non-linearity correction applied successfully")
+	
+	return ramp_cube_corrected, correction_dn
+
+
+def compute_photometric_error_budget(white_light, white_light_norm, oot_mask,
+                                      extraction_info, median_background_per_pixel,
+                                      integration_time_axis,
+                                      read_noise_e, gain_e_per_dn):
+	"""
+	Compute detailed photometric error budget for white-light curve.
+	
+	Proper noise model for ramp-fitted slopes:
+	- Read noise (reduced by ramp fitting process)
+	- Shot noise from star and background (photons accumulated during ramp)
+	
+	Compares to measured scatter in out-of-transit data.
+	
+	Parameters
+	----------
+	white_light : ndarray (nint,)
+		White-light photometry in DN/s
+	white_light_norm : ndarray (nint,)
+		Normalized white-light curve
+	oot_mask : ndarray (nint,), bool
+		True for out-of-transit integrations
+	extraction_info : dict
+		Extraction info with 'aperture_width_pixels', 'background_per_pixel',
+		and optionally 'group_times'
+	median_background_per_pixel : ndarray (nchan,)
+		Median background per pixel in DN/s for each wavelength channel
+	integration_time_axis : ndarray (nint,)
+		Time axis in seconds
+	read_noise_e : float
+		Read noise in electrons per read
+	gain_e_per_dn : float
+		Gain in electrons per DN
+	
+	Returns
+	-------
+	dict with error budget components and diagnostic plots
+	"""
+	nint = len(white_light)
+	
+	# Get aperture size - sum of widths across all dispersion channels
+	aperture_width_pixels = extraction_info['aperture_width_pixels']  # (nchan,)
+	n_pixels = int(np.sum(aperture_width_pixels))  # Total number of pixels in aperture
+	background_per_pixel = extraction_info['background_per_pixel']  # (nint, nchan)
+	
+	# Get group times from extraction_info or use defaults
+	if 'group_times' in extraction_info:
+		group_times = extraction_info['group_times']
+	else:
+		# Default JWST SOSS times if not provided
+		group_times = np.array([0.9225, 8.3025, 15.6825, 23.0625, 30.4425, 37.8225])
+	
+	ngroups = len(group_times)
+	
+	print("="*60)
+	print("PHOTOMETRIC ERROR BUDGET")
+	print("="*60)
+	print(f"\nDEBUG INFO:")
+	print(f"  Number of wavelength channels: {len(aperture_width_pixels)}")
+	print(f"  Aperture width per channel range: {np.min(aperture_width_pixels):.1f} to {np.max(aperture_width_pixels):.1f} pixels")
+	print(f"  Total aperture size: {n_pixels} pixels")
+	print(f"  background_per_pixel shape: {background_per_pixel.shape}")
+	print(f"  median_background_per_pixel shape: {median_background_per_pixel.shape}")
+	
+	# Let's check a few channels to understand the units
+	print(f"\nChecking first few channels:")
+	for i in range(min(3, len(aperture_width_pixels))):
+		print(f"  Channel {i}: aperture = {aperture_width_pixels[i]:.1f} pix, "
+		      f"bg_value = {median_background_per_pixel[i]:.1f}, "
+		      f"bg_value/aperture = {median_background_per_pixel[i]/aperture_width_pixels[i]:.1f}")
+	
+	print(f"\nInstrument parameters:")
+	print(f"  Read noise: {read_noise_e:.1f} e-")
+	print(f"  Gain: {gain_e_per_dn:.2f} e-/DN")
+	print(f"  Number of groups: {ngroups}")
+	
+	# CHECK: Is background_per_pixel actually per pixel, or is it total per channel?
+	# If it's per pixel: multiply by aperture width then sum
+	# If it's already total per channel: just sum
+	
+	# Let's compute both ways and see which makes sense
+	if_per_pixel = np.sum(median_background_per_pixel * aperture_width_pixels)
+	if_total_per_channel = np.sum(median_background_per_pixel)
+	
+	print(f"\nTesting two interpretations of 'background_per_pixel':")
+	print(f"  If DN/s/pixel: {if_per_pixel:.1f} DN/s total")
+	print(f"  If DN/s/channel: {if_total_per_channel:.1f} DN/s total")
+	
+	# background_per_pixel is the sky background in DN/s/pixel for each wavelength channel
+	# Shape: (n_integrations, n_channels) in DN/s/pixel
+	# aperture_width_pixels: (n_channels,) number of pixels in each channel's aperture
+	
+	# First, let's check what the typical sky background per pixel is
+	median_sky_per_pixel = np.median(median_background_per_pixel)  # Median across all channels
+	print(f"\nSky background per pixel (median across channels): {median_sky_per_pixel:.1f} DN/s/pixel")
+	print(f"Sky background range: {np.min(median_background_per_pixel):.1f} to {np.max(median_background_per_pixel):.1f} DN/s/pixel")
+	
+	# Total sky background = sum over all channels of (sky_per_pixel * aperture_width)
+	# This gives total DN/s from background across all wavelength channels
+	median_bg_total = np.sum(median_background_per_pixel * aperture_width_pixels)  # DN/s
+	
+	# white_light is the stellar signal (background already subtracted)
+	# This is also summed across all wavelength channels
+	median_star_signal = np.median(white_light[oot_mask])  # DN/s
+	
+	# Calculate star signal per pixel for context
+	star_per_pixel = median_star_signal / n_pixels
+	
+	print(f"\nMedian signal levels (summed across all wavelengths):")
+	print(f"  Stellar signal (bg-subtracted): {median_star_signal:.1f} DN/s total = {star_per_pixel:.2f} DN/s/pixel")
+	print(f"  Sky background: {median_sky_per_pixel:.1f} DN/s/pixel")
+	print(f"  Total sky (all aperture): {median_bg_total:.1f} DN/s")
+	print(f"  Background/Star per pixel: {median_sky_per_pixel/star_per_pixel:.1f}×")
+	print(f"\n  *** Background is {median_sky_per_pixel/star_per_pixel:.0f}× brighter than star per pixel! ***")
+	print(f"  *** This is expected for faint IR sources with thermal background ***")
+	
+	# Calculate total integration time (last group time)
+	t_int = group_times[-1]  # seconds
+	
+	print(f"  Integration time (last group): {t_int:.2f} s")
+	
+	# For ramp fitting, we need to properly account for how noise propagates
+	# through the slope estimation process.
+	
+	# 1. READ NOISE on slope estimate
+	# For weighted least squares fitting with N groups:
+	# The read noise contribution to the slope depends on the group times.
+	# For approximately equally-spaced reads, the variance on slope is:
+	#   σ²_slope ≈ 12 * σ²_read / (N * (N² - 1) * Δt²)
+	# But we sum across ~n_pixels, so:
+	#   σ²_slope_total ≈ n_pixels * 12 * σ²_read / (N * (N² - 1) * Δt²)
+	
+	# Time spacing
+	dt_avg = t_int / (ngroups - 1)  # average time between groups
+	
+	# Variance on slope from read noise (for one pixel)
+	# Using the formula for slope variance from linear regression
+	var_slope_read_per_pixel = 12.0 * (read_noise_e ** 2) / (ngroups * (ngroups**2 - 1) * dt_avg**2)
+	
+	# Total variance from all pixels in aperture
+	var_slope_read_total = n_pixels * var_slope_read_per_pixel
+	sigma_slope_read_dn = np.sqrt(var_slope_read_total) / gain_e_per_dn  # DN/s
+	read_noise_ppm = 1e6 * sigma_slope_read_dn / median_star_signal
+	
+	# 2. PHOTON SHOT NOISE on slope estimate
+	# The photons accumulate over the integration time.
+	# Star signal: median_star_signal DN/s × t_int s × gain = total electrons
+	# Background signal: median_bg_total DN/s × t_int s × gain = total electrons
+	
+	# Total photons from star during integration
+	star_photons_total = median_star_signal * t_int * gain_e_per_dn
+	
+	# For background, we need to account for how it was measured
+	# Background is measured from ~background_width pixels on each side (typically 10+10=20 pix per channel)
+	# Then subtracted from aperture (typically 7-10 pix per channel)
+	# If we measure bg from n_bg pixels and apply to n_ap pixels:
+	#   Var(star - bg*n_ap) = Var(star) + n_ap² * Var(bg) / n_bg
+	#                       = Var(star) + n_ap * bg_per_pix * (1 + n_ap/n_bg)
+	
+	# First, check if we have background pixel counts in extraction_info
+	if 'background_counts' in extraction_info:
+		background_pixel_counts = extraction_info['background_counts']  # (nint, nchan)
+		median_bg_pixels_per_channel = np.median(background_pixel_counts, axis=0)
+		total_bg_pixels = np.sum(median_bg_pixels_per_channel)
+		print(f"  Background measurement: {total_bg_pixels:.0f} pixels total "
+		      f"({np.median(median_bg_pixels_per_channel):.1f} per channel)")
+	else:
+		# Estimate: background_width pixels on each side
+		bg_width_per_side = 10  # typical value
+		median_bg_pixels_per_channel = 2 * bg_width_per_side  # 20 pixels per channel
+		total_bg_pixels = median_bg_pixels_per_channel * len(aperture_width_pixels)
+		print(f"  Background measurement: ~{total_bg_pixels:.0f} pixels total (estimated)")
+	
+	# Now let's validate the background measurement by checking its scatter
+	# If background is Poisson-limited, scatter should match sqrt(counts)
+	print(f"\n  Validating background measurement (checking for persistence/systematics):")
+	bg_per_channel_vs_time = background_per_pixel  # (nint, nchan) in DN/s
+	bg_scatter_per_channel = np.std(bg_per_channel_vs_time[oot_mask, :], axis=0)  # (nchan,)
+	bg_median_per_channel = np.median(bg_per_channel_vs_time[oot_mask, :], axis=0)  # (nchan,)
+	
+	# Expected Poisson scatter for background measurement (DN/s)
+	# σ²(bg_measured) = bg_photons / n_bg_pixels / t_int² / gain²
+	expected_bg_poisson_scatter = np.sqrt(bg_median_per_channel * gain_e_per_dn * t_int) / (median_bg_pixels_per_channel * t_int * gain_e_per_dn)
+	
+	# Compare measured to expected
+	median_measured_scatter = np.median(bg_scatter_per_channel)
+	median_expected_scatter = np.median(expected_bg_poisson_scatter)
+	excess_bg_factor = median_measured_scatter / median_expected_scatter
+	
+	print(f"    Median background scatter (measured): {median_measured_scatter:.3f} DN/s/pixel")
+	print(f"    Expected Poisson scatter: {median_expected_scatter:.3f} DN/s/pixel")
+	print(f"    Excess factor: {excess_bg_factor:.2f}×")
+	
+	if excess_bg_factor > 1.5:
+		print(f"    *** WARNING: Background has {excess_bg_factor:.1f}× more scatter than Poisson! ***")
+		print(f"    *** This suggests persistence or other systematic effects ***")
+		print(f"    *** However, if variations are common-mode, they may cancel in subtraction ***")
+	
+	# Total photons from background during integration  
+	bg_photons_total = median_bg_total * t_int * gain_e_per_dn
+	
+	# Shot noise on accumulated photons from star
+	star_shot_noise_e = np.sqrt(star_photons_total)
+	
+	# Background shot noise: Use PURE POISSON (theoretical minimum)
+	# The excess scatter might be from systematics that cancel in background subtraction
+	bg_subtraction_factor = 1.0 + n_pixels / total_bg_pixels
+	bg_shot_noise_e = np.sqrt(bg_photons_total * bg_subtraction_factor)
+	
+	print(f"\n  Noise calculation:")
+	print(f"    Star photons: {star_photons_total:.0f} e-")
+	print(f"    Background photons: {bg_photons_total:.0f} e-")
+	print(f"    Bg subtraction factor: {bg_subtraction_factor:.3f}")
+	
+	# Convert to DN/s
+	star_shot_noise_dn_per_s = star_shot_noise_e / gain_e_per_dn / t_int
+	bg_shot_noise_dn_per_s = bg_shot_noise_e / gain_e_per_dn / t_int
+	
+	star_shot_noise_ppm = 1e6 * star_shot_noise_dn_per_s / median_star_signal
+	bg_shot_noise_ppm = 1e6 * bg_shot_noise_dn_per_s / median_star_signal
+	
+	# 3. TOTAL EXPECTED NOISE
+	# Combine read noise and shot noise in quadrature
+	total_expected_dn_per_s = np.sqrt(sigma_slope_read_dn**2 + 
+	                                   star_shot_noise_dn_per_s**2 + 
+	                                   bg_shot_noise_dn_per_s**2)
+	total_expected_ppm = 1e6 * total_expected_dn_per_s / median_star_signal
+	
+	# 4. MEASURED SCATTER
+	oot_residuals = white_light_norm[oot_mask] - np.median(white_light_norm[oot_mask])
+	measured_scatter_ppm = 1e6 * np.std(oot_residuals)
+	
+	# 5. EXCESS NOISE
+	excess_noise_ppm = np.sqrt(max(0, measured_scatter_ppm**2 - total_expected_ppm**2))
+	
+	print(f"\nNoise budget (per integration):")
+	print(f"  Read noise:         {read_noise_ppm:8.1f} ppm")
+	print(f"  Star shot noise:    {star_shot_noise_ppm:8.1f} ppm")
+	print(f"  Sky shot noise:     {bg_shot_noise_ppm:8.1f} ppm")
+	print(f"  {'─'*45}")
+	print(f"  Expected total:     {total_expected_ppm:8.1f} ppm")
+	print(f"  Measured scatter:   {measured_scatter_ppm:8.1f} ppm")
+	print(f"  Excess noise:       {excess_noise_ppm:8.1f} ppm")
+	
+	if excess_noise_ppm > 0:
+		excess_fraction = 100 * excess_noise_ppm / measured_scatter_ppm
+		print(f"\n  Excess is {excess_fraction:.1f}% of measured scatter")
+		print(f"  (likely from systematics: persistence, pointing jitter, flat fielding, etc.)")
+	
+	# Sanity check
+	if total_expected_ppm < measured_scatter_ppm * 0.5:
+		print(f"\n  WARNING: Expected noise is much less than measured!")
+		print(f"  This suggests the noise model may need refinement.")
+	
+	# Create diagnostic plots
+	fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+	
+	# Top: Sky background level over time
+	ax = axes[0]
+	# Total background per integration = sum across channels of (bg_per_pixel * aperture_width)
+	bg_total_vs_time = np.sum(background_per_pixel * aperture_width_pixels[None, :], axis=1)
+	ax.plot(integration_time_axis, bg_total_vs_time, 'o-', 
+	        markersize=4, linewidth=1, alpha=0.7, label='Sky background')
+	ax.axhline(median_bg_total, color='r', linestyle='--', linewidth=2, 
+	           label=f'Median = {median_bg_total:.1f} DN/s')
+	ax.set_ylabel('Sky Background (DN/s)', fontsize=11)
+	ax.set_title('Sky Background Level vs Time (from photometry)', fontsize=12, fontweight='bold')
+	ax.legend(fontsize=10)
+	ax.grid(True, alpha=0.3)
+	
+	# Bottom: Error budget bar chart
+	ax = axes[1]
+	components = ['Read\nNoise', 'Star\nShot', 'Sky\nShot', 
+	              'Expected\nTotal', 'Measured\nScatter', 'Excess\nNoise']
+	values = [read_noise_ppm, star_shot_noise_ppm, bg_shot_noise_ppm,
+	          total_expected_ppm, measured_scatter_ppm, excess_noise_ppm]
+	colors = ['tab:blue', 'tab:orange', 'tab:green', 
+	          'tab:red', 'black', 'tab:purple']
+	
+	bars = ax.bar(components, values, color=colors, alpha=0.7, edgecolor='black', linewidth=1.5)
+	
+	# Add value labels on bars
+	for bar, val in zip(bars, values):
+		height = bar.get_height()
+		ax.text(bar.get_x() + bar.get_width()/2., height,
+		        f'{val:.0f}',
+		        ha='center', va='bottom', fontsize=10, fontweight='bold')
+	
+	ax.set_ylabel('Noise (ppm)', fontsize=11)
+	ax.set_title('Photometric Error Budget', fontsize=12, fontweight='bold')
+	ax.grid(True, alpha=0.3, axis='y')
+	
+	plt.tight_layout()
+	plt.savefig('images/photometric_error_budget.png', dpi=150)
+	plt.show()
+	
+	# Sky background stability plot
+	fig, ax = plt.subplots(figsize=(12, 5))
+	# Total background per integration = sum across channels of (bg_per_pixel * aperture_width)
+	bg_total_per_int = np.sum(background_per_pixel * aperture_width_pixels[None, :], axis=1)
+	median_bg = np.median(bg_total_per_int)
+	bg_deviation = 100 * (bg_total_per_int - median_bg) / median_bg
+	
+	ax.plot(integration_time_axis, bg_deviation, 'o-', 
+	        markersize=4, linewidth=1, alpha=0.7)
+	ax.axhline(0, color='r', linestyle='--', linewidth=1)
+	ax.set_xlabel('Time (s)', fontsize=11)
+	ax.set_ylabel('Sky Background Deviation (%)', fontsize=11)
+	ax.set_title(f'Sky Background Stability (RMS = {np.std(bg_deviation):.2f}%)', 
+	             fontsize=12, fontweight='bold')
+	ax.grid(True, alpha=0.3)
+	
+	plt.tight_layout()
+	plt.savefig('images/sky_background_stability.png', dpi=150)
+	plt.show()
+	
+	return {
+		'n_pixels': n_pixels,
+		'median_star_signal': median_star_signal,
+		'median_sky_background': median_bg_total,
+		'read_noise_ppm': read_noise_ppm,
+		'star_shot_noise_ppm': star_shot_noise_ppm,
+		'sky_shot_noise_ppm': bg_shot_noise_ppm,
+		'total_expected_ppm': total_expected_ppm,
+		'measured_scatter_ppm': measured_scatter_ppm,
+		'excess_noise_ppm': excess_noise_ppm,
+	}
